@@ -39,7 +39,13 @@ impl Device {
         }
         let file = opts.open(path).map_err(|e| {
             if writable && e.raw_os_error() == Some(32) {
-                io::Error::new(io::ErrorKind::ResourceBusy, "the disk is already open for writing by another program")
+                let why = if paragon_running() {
+                    "Paragon APFS for Windows is running and has the disk open: quit it and stop its \
+                     \"ParagonAPFSMounter\" service (or uninstall it), then try again"
+                } else {
+                    "the disk is already open for writing by another program"
+                };
+                io::Error::new(io::ErrorKind::ResourceBusy, why)
             } else {
                 e
             }
@@ -126,6 +132,19 @@ impl Device {
         }
         Ok(done)
     }
+}
+
+/// Whether Paragon's APFS service, which mounts APFS disks itself, is running.
+fn paragon_running() -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("sc")
+            .args(["query", "ParagonAPFSMounter"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn eof(at: u64) -> io::Error {

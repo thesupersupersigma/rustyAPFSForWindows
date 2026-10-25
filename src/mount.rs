@@ -880,7 +880,7 @@ fn start(m: Mount) -> io::Result<FileSystemHost<ApfsFs>> {
         .file_info_timeout(if rw { 0 } else { u32::MAX });
     let mut host: FileSystemHost<ApfsFs> =
         FileSystemHost::new(params, m.fs).map_err(failed("creating the file system"))?;
-    host.mount(&m.mountpoint).map_err(failed("mounting"))?;
+    host.mount(global_mountpoint(&m.mountpoint)).map_err(failed("mounting"))?;
     host.start().map_err(failed("starting the dispatcher"))?;
     println!("mounted at {} ({})", m.mountpoint, if rw { "read-write" } else { "read-only" });
     Ok(host)
@@ -1026,6 +1026,24 @@ pub fn mount(c: &'static Container, vol: Volume<'static>, mountpoint: &str) -> i
 /// Mounts volume `v` of `w` read-write at `mountpoint` until Ctrl+C, committing changes as it goes.
 pub fn mount_rw(w: Writer, v: usize, mountpoint: &str) -> io::Result<()> {
     serve(vec![through_writer(&Arc::new(Mutex::new(w)), v, mountpoint)?])
+}
+
+/// An administrator's drive letters normally exist only in its own (elevated) session, so Explorer,
+/// which runs unelevated, wouldn't see them. `\\.\X:` makes WinFsp create the drive through the
+/// Mount Manager instead, visible to every user and process.
+fn global_mountpoint(mp: &str) -> String {
+    let is_letter = mp.len() == 2 && mp.as_bytes()[0].is_ascii_alphabetic() && mp.as_bytes()[1] == b':';
+    if is_letter && is_admin() { format!(r"\\.\{mp}") } else { mp.to_string() }
+}
+
+/// True when running elevated.
+pub fn is_admin() -> bool {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn IsUserAnAdmin() -> i32;
+    }
+    // SAFETY: no arguments.
+    unsafe { IsUserAnAdmin() != 0 }
 }
 
 /// Drive letters not in use, from Z: down (so they don't collide with removable drives Windows adds).
