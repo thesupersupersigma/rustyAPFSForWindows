@@ -17,7 +17,7 @@ Built from Apple's public [Apple File System Reference](https://developer.apple.
 | Encrypted volumes (software/FileVault-style, password unlock) | done (`--password`) |
 | Per-file (hardware) encryption | not supported |
 | Physical disks / GPT partitions | done (`apfs list`, needs admin) |
-| Mounting as a drive letter (WinFsp) | not yet |
+| Mounting as a drive letter (WinFsp) | read-only done (`apfs <image> mount X:`) |
 | Writing | not yet |
 
 ## Try it

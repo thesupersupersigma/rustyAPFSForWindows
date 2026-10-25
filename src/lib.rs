@@ -5,6 +5,8 @@ mod compress;
 mod container;
 mod crypto;
 mod device;
+#[cfg(windows)]
+pub mod mount;
 mod volume;
 
 pub use container::Container;

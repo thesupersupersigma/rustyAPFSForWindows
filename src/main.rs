@@ -5,7 +5,8 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: apfs list                      (APFS partitions on physical disks; needs admin)
        apfs <image|disk> info [--partition N] [--password PW]
        apfs <image|disk> ls  [path] [--volume N] [--snapshot NAME] [--password PW]
-       apfs <image|disk> cat <path> [--volume N] [--snapshot NAME] [--password PW]";
+       apfs <image|disk> cat <path> [--volume N] [--snapshot NAME] [--password PW]
+       apfs <image|disk> mount <X: | new-folder> [--volume N] [--snapshot NAME] [--password PW]";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -36,8 +37,10 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
         Some(n) => Container::open_partition(image, n)?,
         None => Container::open(image)?,
     };
+    // Leaked: it lives for the whole process, and the mount needs a 'static borrow.
+    let c: &'static Container = Box::leak(Box::new(c));
     if cmd == "info" {
-        return info(&c, password.as_deref());
+        return info(c, password.as_deref());
     }
     let vols = c.volumes()?;
     let mut vol = vols.into_iter().nth(vol_idx).ok_or_else(|| io::Error::other(format!("no volume {vol_idx}")))?;
@@ -61,6 +64,8 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
             let f = vol.open(&vol.lookup(path)?)?;
             io::stdout().lock().write_all(&f.read_all()?)
         }
+        #[cfg(windows)]
+        "mount" => rusty_apfs::mount::mount(c, vol, rest.first().ok_or_else(usage)?),
         _ => Err(usage()),
     }
 }
