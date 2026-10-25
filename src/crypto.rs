@@ -32,6 +32,11 @@ impl Xts {
     pub(crate) fn decrypt(&self, buf: &mut [u8], sector: u64) {
         self.0.decrypt_area(buf, 512, sector as u128, get_tweak_default);
     }
+
+    /// Encrypts `buf` in place; `sector` is the tweak of its first 512-byte unit.
+    pub(crate) fn encrypt(&self, buf: &mut [u8], sector: u64) {
+        self.0.encrypt_area(buf, 512, sector as u128, get_tweak_default);
+    }
 }
 
 /// Derives the volume encryption key from a user password (spec: "Accessing Encrypted Objects").

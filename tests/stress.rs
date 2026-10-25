@@ -84,16 +84,45 @@ fn parent_of(path: &str) -> (&str, &str) {
     }
 }
 
-fn ino(w: &Writer, path: &str) -> u64 {
-    if path.is_empty() { 2 } else { w.view(0).unwrap().lookup(path).unwrap().id }
+/// `base` is the directory the test works in ("" = volume root); model paths are relative to it.
+fn under(base: &str, path: &str) -> String {
+    match (base.is_empty(), path.is_empty()) {
+        (true, _) => path.to_string(),
+        (false, true) => base.to_string(),
+        (false, false) => format!("{base}/{path}"),
+    }
+}
+
+fn ino(w: &Writer, base: &str, path: &str) -> u64 {
+    let full = under(base, path);
+    if full.is_empty() { 2 } else { w.view(0).unwrap().lookup(&full).unwrap().id }
+}
+
+fn open(p: &Path, password: Option<&str>) -> Writer {
+    let mut w = Writer::open(p, None).unwrap();
+    if let Some(pw) = password {
+        w.unlock(0, pw).unwrap();
+    }
+    w
+}
+
+/// apfsck can't check software-encrypted volumes.
+fn fsck_unless_encrypted(p: &Path, password: Option<&str>) {
+    if password.is_none() {
+        fsck(p);
+    }
 }
 
 /// Compares the image (as our reader sees it) against the model.
-fn check(p: &Path, model: &Model) {
+fn check(p: &Path, password: Option<&str>, base: &str, model: &Model) {
     let c = Container::open(p).unwrap();
-    let v = c.volumes().unwrap().remove(0);
+    let mut v = c.volumes().unwrap().remove(0);
+    if let Some(pw) = password {
+        v.unlock(pw).unwrap();
+    }
+    let start = if base.is_empty() { 2 } else { v.lookup(base).unwrap().id };
     let mut seen = BTreeMap::new();
-    let mut stack = vec![(2u64, String::new())];
+    let mut stack = vec![(start, String::new())];
     while let Some((dir, prefix)) = stack.pop() {
         for e in v.read_dir(dir).unwrap() {
             let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
@@ -129,13 +158,20 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
     std::fs::File::create(&p).unwrap().set_len(mib << 20).unwrap();
     let out = Command::new(tool("mkapfs")).args(["-L", "Stress"]).arg(&p).output().unwrap();
     assert!(out.status.success());
+    run_on(&p, None, "", seed, ops, crashes);
+    std::fs::remove_file(&p).unwrap();
+}
+
+/// Runs the random workload inside directory `base` of volume 0 of image `p`.
+fn run_on(p: &Path, password: Option<&str>, base: &str, seed: u64, ops: usize, crashes: bool) {
+    let p = p.to_path_buf();
 
     let mut rng = Rng(seed | 1);
     let mut model = Model::default();
     let mut committed = Model::default();
     // Files whose data changed since the last commit: in-place overwrites survive a crash.
     let mut dirty: HashSet<u64> = HashSet::new();
-    let mut w = Writer::open(&p, None).unwrap();
+    let mut w = open(&p, password);
     let names = ["a", "b", "Docs", "photo.jpg", "notes.txt", "x y z", "über", "ÜBER2", "data.bin", "z"];
     let join = |d: &str, n: &str| if d.is_empty() { n.to_string() } else { format!("{d}/{n}") };
     for step in 0..ops {
@@ -151,7 +187,7 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 let path = join(&d, &name);
                 let exists = model.find_ci(&path).is_some();
                 let dir = rng.below(4) == 0;
-                let pid = ino(&w, &d);
+                let pid = ino(&w, base, &d);
                 let r = w.create(0, pid, &name, if dir { Kind::Dir } else { Kind::File }, 0o644);
                 assert_eq!(r.is_ok(), !exists, "create {path:?}: {r:?}");
                 if r.is_ok() {
@@ -165,7 +201,7 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 let name = new_name(&mut rng);
                 let path = join(&d, &name);
                 let exists = model.find_ci(&path).is_some();
-                let (sid, pid) = (ino(&w, &src), ino(&w, &d));
+                let (sid, pid) = (ino(&w, base, &src), ino(&w, base, &d));
                 if rng.below(2) == 0 {
                     let r = w.link(0, sid, pid, &name);
                     assert_eq!(r.is_ok(), !exists, "link {src:?} -> {path:?}: {r:?}");
@@ -193,7 +229,7 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 };
                 let len = [1, 100, 4096, 5000, 70_000][rng.below(5) as usize];
                 let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
-                let id = ino(&w, &f);
+                let id = ino(&w, base, &f);
                 dirty.insert(id);
                 w.write_at(0, id, off, &bytes).unwrap();
                 let end = off as usize + len;
@@ -210,7 +246,7 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                     1 => rng.below(data.len() as u64 + 1),
                     _ => data.len() as u64 + rng.below(200_000),
                 };
-                let id = ino(&w, &f);
+                let id = ino(&w, base, &f);
                 dirty.insert(id);
                 w.set_size(0, id, size).unwrap();
                 data.resize(size as usize, 0);
@@ -219,7 +255,7 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 let path = rng.pick(&all);
                 let (d, name) = parent_of(&path);
                 let nonempty = model.has_children(&path);
-                let pid = ino(&w, d);
+                let pid = ino(&w, base, d);
                 let r = w.remove(0, pid, name);
                 assert_eq!(r.is_ok(), !nonempty, "remove {path:?}: {r:?}");
                 if r.is_ok() {
@@ -237,7 +273,7 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 let target = model.find_ci(&dst);
                 let replace = rng.below(2) == 0;
                 let (sd, sn) = parent_of(&src);
-                let (spid, dpid) = (ino(&w, sd), ino(&w, &d));
+                let (spid, dpid) = (ino(&w, base, sd), ino(&w, base, &d));
                 let r = w.rename(0, spid, sn, dpid, &name, replace);
                 let same_obj = target.as_ref().is_some_and(|t| t != &src && model.paths[t] == model.paths[&src]);
                 let expect_ok = match &target {
@@ -277,14 +313,14 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
             _ => {
                 // Crash: drop uncommitted changes and reopen.
                 drop(w);
-                w = Writer::open(&p, None).unwrap();
+                w = open(&p, password);
                 model = committed.clone();
                 // Metadata rolls back; data overwritten in place may not. Sizes must match the commit.
                 let view = w.view(0).unwrap();
                 for path in model.paths.keys().cloned().collect::<Vec<_>>() {
                     let id = model.paths[&path];
                     if let Node::File(want) = model.objs.get_mut(&id).unwrap() {
-                        let inode = view.lookup(&path).unwrap();
+                        let inode = view.lookup(&under(base, &path)).unwrap();
                         let got = view.open(&inode).unwrap().read_all().unwrap();
                         assert_eq!(got.len(), want.len(), "{path:?} size after crash");
                         if &got != want {
@@ -303,16 +339,15 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
             committed = model.clone();
             dirty.clear();
             drop(w);
-            check(&p, &committed);
-            fsck(&p);
-            w = Writer::open(&p, None).unwrap();
+            check(&p, password, base, &committed);
+            fsck_unless_encrypted(&p, password);
+            w = open(&p, password);
         }
     }
     w.commit().unwrap();
     drop(w);
-    check(&p, &model);
-    fsck(&p);
-    std::fs::remove_file(&p).unwrap();
+    check(&p, password, base, &model);
+    fsck_unless_encrypted(&p, password);
 }
 
 #[test]
@@ -334,4 +369,17 @@ fn stress_no_crashes() {
 fn stress_small_disk() {
     // A small container exercises the free-queue limits.
     run(777, 1500, 24, true);
+}
+
+#[test]
+fn stress_encrypted_volume() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ignored/testdata/jhfs_encrypted.bin");
+    let p = std::env::temp_dir().join(format!("rusty-apfs-stress-enc-{}.img", std::process::id()));
+    std::fs::copy(&src, &p).unwrap();
+    let mut w = open(&p, Some("password"));
+    w.create(0, 2, "stress", Kind::Dir, 0o755).unwrap();
+    w.commit().unwrap();
+    drop(w);
+    run_on(&p, Some("password"), "stress", 99, 1500, true);
+    std::fs::remove_file(&p).unwrap();
 }

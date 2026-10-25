@@ -1,7 +1,7 @@
 //! Debug dump of a volume's raw trees, for studying on-disk conventions (`apfs <image> dump`).
 
 use super::Volume;
-use crate::container::OBJ_PHYSICAL;
+use crate::container::{OBJ_PHYSICAL, checksum_ok};
 use crate::{btree, u32le, u64le};
 use std::cmp::Ordering;
 use std::fmt::Write;
@@ -32,31 +32,61 @@ impl Volume<'_> {
         let resolve = |child: u64| {
             if self.physical_tree { Ok(child) } else { self.c.omap_lookup(self.omap_tree, child, self.xid) }
         };
-        btree::walk(self.c, self.root_tree, &resolve, &|_| Ordering::Equal, &mut |k, v| {
-            let h = u64le(k, 0);
-            writeln!(out, "  oid={} type={} key+={} val={}", h & 0x0fff_ffff_ffff_ffff, h >> 60, hex(&k[8..]), hex(v))
+        let key = self.key.as_deref();
+        btree::walk_key(
+            self.c,
+            self.root_tree,
+            &resolve,
+            &|_| Ordering::Equal,
+            &mut |k, v| {
+                let h = u64le(k, 0);
+                writeln!(
+                    out,
+                    "  oid={} type={} key+={} val={}",
+                    h & 0x0fff_ffff_ffff_ffff,
+                    h >> 60,
+                    hex(&k[8..]),
+                    hex(v)
+                )
                 .unwrap();
-            Ok(true)
-        })?;
+                Ok(true)
+            },
+            key,
+        )?;
         let ext = u64le(sb, 144);
         if ext != 0 && u32le(sb, 120) & OBJ_PHYSICAL != 0 {
             writeln!(out, "-- extentref tree @{ext}").unwrap();
-            btree::walk(self.c, ext, &|c| Ok(c), &|_| Ordering::Equal, &mut |k, v| {
-                let h = u64le(k, 0);
-                writeln!(out, "  paddr={} type={} val={}", h & 0x0fff_ffff_ffff_ffff, h >> 60, hex(v)).unwrap();
-                Ok(true)
-            })?;
+            let raw_ok = checksum_ok(&self.c.read_block(ext)?);
+            writeln!(out, "  (root stored {})", if raw_ok { "plain" } else { "encrypted" }).unwrap();
+            btree::walk_key(
+                self.c,
+                ext,
+                &|c| Ok(c),
+                &|_| Ordering::Equal,
+                &mut |k, v| {
+                    let h = u64le(k, 0);
+                    writeln!(out, "  paddr={} type={} val={}", h & 0x0fff_ffff_ffff_ffff, h >> 60, hex(v)).unwrap();
+                    Ok(true)
+                },
+                key,
+            )?;
+        }
+        let sm = u64le(sb, 152);
+        if sm != 0 {
+            let raw_ok = self.c.read_block(sm).is_ok_and(|b| checksum_ok(&b));
+            writeln!(out, "-- snap meta tree @{sm} stored {}", if raw_ok { "plain" } else { "encrypted" }).unwrap();
         }
         writeln!(out, "-- volume omap").unwrap();
         btree::walk(self.c, self.omap_tree, &|c| Ok(c), &|_| Ordering::Equal, &mut |k, v| {
             writeln!(
                 out,
-                "  oid={} xid={} flags={:#x} size={} paddr={}",
+                "  oid={} xid={} flags={:#x} size={} paddr={} stored={}",
                 u64le(k, 0),
                 u64le(k, 8),
                 u32le(v, 0),
                 u32le(v, 4),
-                u64le(v, 8)
+                u64le(v, 8),
+                if self.c.read_block(u64le(v, 8)).is_ok_and(|b| checksum_ok(&b)) { "plain" } else { "encrypted" }
             )
             .unwrap();
             Ok(true)

@@ -14,7 +14,7 @@ Built from Apple's public [Apple File System Reference](https://developer.apple.
 | Extended attributes (inline and stream) | done |
 | Compressed files (zlib, LZVN, LZFSE, inline and resource fork) | done |
 | Snapshots (read-only views) | done |
-| Encrypted volumes (software/FileVault-style, password unlock) | done (`--password`) |
+| Encrypted volumes (software/FileVault-style, password unlock) | read and write (`--password`) |
 | Per-file (hardware) encryption | not supported |
 | Physical disks / GPT partitions | done (`apfs list`, needs admin) |
 | Mounting as a drive letter (WinFsp) | done: read-write when the volume allows it, else read-only (`apfs <image> mount X: [--read-only]`) |

@@ -122,8 +122,14 @@ enum Data {
 
 impl<'c> Volume<'c> {
     /// A view at `xid` whose object map tree root is already known (used by the writer).
-    pub(crate) fn with_root(c: &'c Container, sb: Vec<u8>, xid: u64, omap_tree: u64) -> io::Result<Volume<'c>> {
-        Self::with_omap(c, sb, xid, Some(omap_tree), None)
+    pub(crate) fn with_root(
+        c: &'c Container,
+        sb: Vec<u8>,
+        xid: u64,
+        omap_tree: u64,
+        key: Option<Arc<Xts>>,
+    ) -> io::Result<Volume<'c>> {
+        Self::with_omap(c, sb, xid, Some(omap_tree), key)
     }
 
     pub(crate) fn new(c: &'c Container, sb: Vec<u8>, xid: u64) -> io::Result<Volume<'c>> {
