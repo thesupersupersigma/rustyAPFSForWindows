@@ -346,3 +346,29 @@ fn bench() {
     println!("apfsck {:.1}s", t.elapsed().as_secs_f64());
     std::fs::remove_file(&p).unwrap();
 }
+
+#[test]
+fn directory_statistics_stay_correct() {
+    let p = fresh("dirstats", 64, &["-L", "Stats"]);
+    let mut w = Writer::open(&p, None).unwrap();
+    let top = w.create(0, 2, "tracked", Kind::Dir, 0o755).unwrap();
+    w.enable_dir_stats(0, top).unwrap();
+    let sub = w.create(0, top, "sub", Kind::Dir, 0o755).unwrap();
+    let a = w.create(0, top, "a.bin", Kind::File, 0o644).unwrap();
+    w.write_at(0, a, 0, &pattern(12_345, 1)).unwrap();
+    let b = w.create(0, sub, "b.bin", Kind::File, 0o644).unwrap();
+    w.write_at(0, b, 0, &pattern(70_000, 2)).unwrap();
+    w.commit().unwrap();
+    fsck(&p);
+    w.set_size(0, a, 100).unwrap();
+    w.clone_file(0, b, top, "b clone.bin").unwrap();
+    w.link(0, a, sub, "a link.bin").unwrap();
+    w.rename(0, sub, "b.bin", 2, "b moved out.bin", false).unwrap();
+    w.remove(0, top, "a.bin").unwrap();
+    let outside = w.create(0, 2, "outside", Kind::Dir, 0o755).unwrap();
+    assert_eq!(w.rename(0, 2, "outside", top, "outside", false).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    let _ = outside;
+    w.commit().unwrap();
+    drop(w);
+    fsck(&p);
+}

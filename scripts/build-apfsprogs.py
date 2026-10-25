@@ -1,7 +1,8 @@
 """Build apfsck.exe and mkapfs.exe from linux-apfs/apfsprogs for validating our writes on Windows.
 
 apfsprogs is GPLv2, so it is cloned into the gitignored tools/ dir rather than vendored here.
-Our Windows shim (scripts/apfsprogs-compat) is force-included; the apfsprogs sources are not modified.
+Our Windows shim (scripts/apfsprogs-compat) is force-included. The only source edits are the upstream bug
+fixes listed in FIXES, applied after checkout (git checkout restores the pristine files first).
 
 Needs Visual Studio with the "C++ Clang tools" (clang-cl). Usage: python scripts/build-apfsprogs.py
 """
@@ -27,6 +28,15 @@ TOOLS = {
 }
 
 
+# (file, buggy line, fixed line): upstream bugs that make apfsck reject valid volumes.
+FIXES = [
+    # Directory statistics: file sizes were added to the on-disk total instead of the computed one,
+    # so any tracked folder with non-empty files was reported as "wrong total size".
+    ("apfsck/inode.c", "parent_stat->ds_total_size += inode->i_dstream->d_size;",
+     "parent_stat->ds_child_size += inode->i_dstream->d_size;"),
+]
+
+
 def run(cmd, **kw):
     print(">", cmd if isinstance(cmd, str) else " ".join(map(str, cmd)))
     subprocess.run(cmd, check=True, **kw)
@@ -39,6 +49,13 @@ def checkout():
     if head.strip() != PIN:
         run(["git", "fetch", "-q", "origin"], cwd=SRC)
         run(["git", "checkout", "-q", PIN], cwd=SRC)
+    run(["git", "checkout", "-q", "--", "."], cwd=SRC)
+    for rel, old, new in FIXES:
+        path = SRC / rel
+        text = path.read_text()
+        if old not in text:
+            sys.exit(f"fix no longer applies to {rel}: {old!r}")
+        path.write_text(text.replace(old, new))
 
 
 def visual_studio():

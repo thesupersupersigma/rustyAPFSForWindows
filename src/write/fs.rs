@@ -45,6 +45,10 @@ const PEXT_LEN_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 const T_SIBLING_LINK: u64 = 5;
 const T_SIBLING_MAP: u64 = 12;
 const DREC_EXT_TYPE_SIBLING_ID: u8 = 1;
+const INODE_MAINTAIN_DIR_STATS: u64 = 0x2;
+const INODE_DIR_STATS_ORIGIN: u64 = 0x4;
+const INO_DIR_STATS: u8 = 10;
+const T_DIR_STATS: u64 = 10;
 
 /// What `create` makes.
 pub enum Kind {
@@ -265,7 +269,11 @@ impl Writer {
         fixed[80..82].copy_from_slice(&mode.to_le_bytes());
         let mut name0 = name.as_bytes().to_vec();
         name0.push(0);
-        let rec = InodeRec { fixed, xf: vec![(INO_NAME, XF_DO_NOT_COPY, name0)] };
+        let mut rec = InodeRec { fixed, xf: vec![(INO_NAME, XF_DO_NOT_COPY, name0)] };
+        if let (Kind::Dir, Some(stat)) = (&kind, dirstat_of(&p)) {
+            rec.set_u64(48, rec.u64(48) | INODE_MAINTAIN_DIR_STATS);
+            rec.set(INO_DIR_STATS, XF_SYSTEM_FIELD | XF_DO_NOT_COPY, stat.to_le_bytes().to_vec());
+        }
         self.put_inode(v, ino, &rec)?;
 
         let mut dval = vec![0u8; 18];
@@ -281,7 +289,7 @@ impl Writer {
             self.put_xattr(v, ino, "com.apple.fs.symlink", XATTR_DATA_EMBEDDED | XATTR_FILE_SYSTEM_OWNED, &t)?;
         }
 
-        p.set_nlink(p.nlink() + 1); // nchildren for directories
+        self.adjust_dir(v, &mut p, 1)?;
         p.touch(now);
         self.put_inode(v, parent, &p)?;
         self.vol_add(v, counter, 1);
@@ -553,6 +561,7 @@ impl Writer {
         size: u64,
     ) -> io::Result<()> {
         let new = merge(new, self.c.block_size);
+        let before = self.size_owner(v, &rec)?;
         let private = rec.u64(8);
         self.sync_extents(v, private, old, &new)?;
         let alloced: u64 = new.iter().map(|e| e.len).sum();
@@ -571,6 +580,8 @@ impl Writer {
             rec.set_u64(48, flags & !INODE_IS_SPARSE);
         }
         rec.touch(now());
+        let after = self.size_owner(v, &rec)?;
+        self.move_size(v, before, after)?;
         self.put_inode(v, ino, &rec)
     }
 
@@ -708,6 +719,7 @@ impl Writer {
         if is_dir && rec.nlink() != 0 {
             return Err(io::Error::new(io::ErrorKind::DirectoryNotEmpty, format!("{name:?} is not empty")));
         }
+        let before = self.size_owner(v, &rec)?;
         self.tree_del(TreeId::Fs(v), &e.key)?;
         if let Some(sib) = sibling_of(&e.val) {
             self.tree_del(TreeId::Fs(v), &sibling_key(e.id, sib))?;
@@ -723,14 +735,17 @@ impl Writer {
             }
             rec.set_u64(32, now());
             self.put_inode(v, e.id, &rec)?;
+            let after = self.size_owner(v, &rec)?;
+            self.move_size(v, before, after)?;
             let mut p = self.inode_rec(v, parent)?;
-            p.set_nlink(p.nlink() - 1);
+            self.adjust_dir(v, &mut p, -1)?;
             p.touch(now());
             return self.put_inode(v, parent, &p);
         }
+        self.move_size(v, before, None)?;
         self.delete_inode(v, e.id, &rec)?;
         let mut p = self.inode_rec(v, parent)?;
-        p.set_nlink(p.nlink() - 1);
+        self.adjust_dir(v, &mut p, -1)?;
         p.touch(now());
         self.put_inode(v, parent, &p)?;
         let counter = match rec.mode() & S_IFMT {
@@ -828,7 +843,7 @@ impl Writer {
         rec.set_u64(32, now());
         self.put_inode(v, ino, &rec)?;
         let mut p = self.inode_rec(v, new_parent)?;
-        p.set_nlink(p.nlink() + 1);
+        self.adjust_dir(v, &mut p, 1)?;
         p.touch(now());
         self.put_inode(v, new_parent, &p)
     }
@@ -857,6 +872,8 @@ impl Writer {
             c.set_u64(48, c.u64(48) | INODE_IS_SPARSE);
         }
         self.put_inode(v, ino, &c)?;
+        let owner = self.size_owner(v, &c)?;
+        self.move_size(v, None, owner)?;
         s.set_u64(48, s.u64(48) | flags);
         self.put_inode(v, src, &s)?;
         Ok(ino)
@@ -903,6 +920,17 @@ impl Writer {
         if rec.mode() & S_IFMT == S_IFDIR && self.is_ancestor(v, src.id, new_parent)? {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "can't move a directory into itself"));
         }
+        if rec.mode() & S_IFMT == S_IFDIR
+            && parent != new_parent
+            && dirstat_of(&self.inode_rec(v, parent)?) != dirstat_of(&self.inode_rec(v, new_parent)?)
+        {
+            // shortcut: would need rewriting the whole subtree's statistics membership.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "moving a folder into or out of a folder that tracks its size isn't supported",
+            ));
+        }
+        let before = self.size_owner(v, &rec)?;
         let now = now();
         self.tree_del(TreeId::Fs(v), &src.key)?;
         let dkey = self.drec_key(v, new_parent, new_name);
@@ -921,19 +949,79 @@ impl Writer {
         }
         rec.set_u64(32, now);
         self.put_inode(v, src.id, &rec)?;
+        let after = self.size_owner(v, &rec)?;
+        self.move_size(v, before, after)?;
         let mut p = self.inode_rec(v, parent)?;
         p.touch(now);
         if parent != new_parent {
-            p.set_nlink(p.nlink() - 1);
+            self.adjust_dir(v, &mut p, -1)?;
             self.put_inode(v, parent, &p)?;
             let mut np = self.inode_rec(v, new_parent)?;
-            np.set_nlink(np.nlink() + 1);
+            self.adjust_dir(v, &mut np, 1)?;
             np.touch(now);
             self.put_inode(v, new_parent, &np)?;
         } else {
             self.put_inode(v, parent, &p)?;
         }
         Ok(())
+    }
+
+    /// Changes a directory's child count, and its directory statistics if it keeps them.
+    fn adjust_dir(&mut self, v: usize, dir: &mut InodeRec, children: i32) -> io::Result<()> {
+        dir.set_nlink(dir.nlink() + children);
+        match dirstat_of(dir) {
+            Some(stat) => self.stat_add(v, stat, children as i64, 0),
+            None => Ok(()),
+        }
+    }
+
+    fn stat_add(&mut self, v: usize, stat: u64, children: i64, size: i64) -> io::Result<()> {
+        let k = key(stat, T_DIR_STATS);
+        let Some(mut val) = self.tree_get(TreeId::Fs(v), &k)? else { return Ok(()) };
+        let (n, total, gen_count) =
+            (u64le(&val, 0) as i64 + children, u64le(&val, 8) as i64 + size, u64le(&val, 24) + 1);
+        put64(&mut val, 0, n as u64);
+        put64(&mut val, 8, total as u64);
+        put64(&mut val, 24, gen_count);
+        self.tree_put(TreeId::Fs(v), &k, &val).map(|_| ())
+    }
+
+    /// The directory statistics a regular file's size counts toward (its primary parent's), and the size.
+    fn size_owner(&self, v: usize, rec: &InodeRec) -> io::Result<Option<(u64, u64)>> {
+        let parent = rec.u64(0);
+        if rec.mode() & S_IFMT != S_IFREG || parent <= crate::volume::ROOT_DIR_INO && parent != 2 {
+            return Ok(None);
+        }
+        let size = rec.get(INO_DSTREAM).map_or(0, |d| u64le(d, 0));
+        Ok(dirstat_of(&self.inode_rec(v, parent)?).map(|s| (s, size)))
+    }
+
+    fn move_size(&mut self, v: usize, before: Option<(u64, u64)>, after: Option<(u64, u64)>) -> io::Result<()> {
+        if before == after {
+            return Ok(());
+        }
+        if let Some((s, n)) = before {
+            self.stat_add(v, s, 0, -(n as i64))?;
+        }
+        if let Some((s, n)) = after {
+            self.stat_add(v, s, 0, n as i64)?;
+        }
+        Ok(())
+    }
+
+    /// Turns on size tracking ("directory statistics") for an empty directory, as macOS can.
+    #[doc(hidden)]
+    pub fn enable_dir_stats(&mut self, v: usize, dir: u64) -> io::Result<()> {
+        self.writable(v)?;
+        let mut rec = self.inode_rec(v, dir)?;
+        if rec.mode() & S_IFMT != S_IFDIR || rec.nlink() != 0 || dirstat_of(&rec).is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "needs an empty directory without stats"));
+        }
+        let stat = self.new_obj_id(v);
+        self.tree_put(TreeId::Fs(v), &key(stat, T_DIR_STATS), &[0u8; 32])?;
+        rec.set_u64(48, rec.u64(48) | INODE_MAINTAIN_DIR_STATS | INODE_DIR_STATS_ORIGIN);
+        rec.set(INO_DIR_STATS, XF_SYSTEM_FIELD | XF_DO_NOT_COPY, stat.to_le_bytes().to_vec());
+        self.put_inode(v, dir, &rec)
     }
 
     /// True if directory `dir` is `id` or one of its ancestors chain contains `id`.
@@ -989,6 +1077,14 @@ impl Writer {
         rec.set_u64(32, now());
         self.put_inode(v, ino, &rec)
     }
+}
+
+/// The directory-statistics object a directory contributes to, if it maintains statistics.
+fn dirstat_of(rec: &InodeRec) -> Option<u64> {
+    if rec.u64(48) & INODE_MAINTAIN_DIR_STATS == 0 {
+        return None;
+    }
+    rec.get(INO_DIR_STATS).filter(|d| d.len() >= 8).map(|d| u64le(d, 0))
 }
 
 fn check_name(name: &str) -> io::Result<()> {
