@@ -386,6 +386,19 @@ impl Writer {
         Ok(node.entries.binary_search_by(|(k, _)| (def.cmp)(k, key)).ok().map(|i| node.entries[i].1.clone()))
     }
 
+    /// The record with the largest key <= `key`, if any.
+    pub(crate) fn tree_floor(&self, t: TreeId, key: &[u8]) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let def = self.def(t);
+        let mut node = self.load(&def, self.root_ptr(t))?;
+        while !node.leaf() {
+            let i = child_index(&def, &node, key);
+            node = self.load(&def, u64le(&node.entries[i].1, 0))?;
+        }
+        // The chosen leaf's first key is <= `key` unless `key` precedes the whole tree.
+        let n = node.entries.partition_point(|(k, _)| (def.cmp)(k, key) != Ordering::Greater);
+        Ok(n.checked_sub(1).map(|i| node.entries.swap_remove(i)))
+    }
+
     /// Inserts or replaces a record; returns the old value.
     pub(crate) fn tree_put(&mut self, t: TreeId, key: &[u8], val: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let mut old = None;

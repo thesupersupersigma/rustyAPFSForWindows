@@ -1,5 +1,6 @@
-//! Randomized write test: random operations against an in-memory model, random commits and simulated
-//! crashes (dropping the writer without committing), then a full comparison and apfsck.
+//! Randomized write test: random operations (including hard links and clones) against an in-memory
+//! model, random commits and simulated crashes (dropping the writer without committing), then a full
+//! comparison and apfsck.
 
 use rusty_apfs::Container;
 use rusty_apfs::write::{Kind, Writer};
@@ -19,6 +20,9 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
+    fn pick<T: Clone>(&mut self, v: &[T]) -> T {
+        v[self.below(v.len() as u64) as usize].clone()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,7 +31,39 @@ enum Node {
     File(Vec<u8>),
 }
 
-type Model = BTreeMap<String, Node>; // "/"-joined path from the root -> node
+/// Paths map to object ids so hard links share one object; clones get their own.
+#[derive(Clone, Default)]
+struct Model {
+    paths: BTreeMap<String, u64>,
+    objs: BTreeMap<u64, Node>,
+    next: u64,
+}
+
+impl Model {
+    fn node(&self, path: &str) -> &Node {
+        &self.objs[&self.paths[path]]
+    }
+    fn is_dir(&self, path: &str) -> bool {
+        *self.node(path) == Node::Dir
+    }
+    fn find_ci(&self, path: &str) -> Option<String> {
+        self.paths.keys().find(|k| k.to_lowercase() == path.to_lowercase()).cloned()
+    }
+    fn has_children(&self, path: &str) -> bool {
+        self.paths.keys().any(|k| k.starts_with(&format!("{path}/")))
+    }
+    fn add(&mut self, path: String, node: Node) {
+        self.next += 1;
+        self.paths.insert(path, self.next);
+        self.objs.insert(self.next, node);
+    }
+    fn unlink(&mut self, path: &str) {
+        let id = self.paths.remove(path).unwrap();
+        if !self.paths.values().any(|&i| i == id) {
+            self.objs.remove(&id);
+        }
+    }
+}
 
 fn tool(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/bin").join(format!("{name}.exe"));
@@ -56,7 +92,7 @@ fn ino(w: &Writer, path: &str) -> u64 {
 fn check(p: &Path, model: &Model) {
     let c = Container::open(p).unwrap();
     let v = c.volumes().unwrap().remove(0);
-    let mut seen = Model::new();
+    let mut seen = BTreeMap::new();
     let mut stack = vec![(2u64, String::new())];
     while let Some((dir, prefix)) = stack.pop() {
         for e in v.read_dir(dir).unwrap() {
@@ -70,26 +106,22 @@ fn check(p: &Path, model: &Model) {
             }
         }
     }
-    for (k, want) in model {
-        let got = seen.get(k).unwrap_or_else(|| panic!("missing {k:?}"));
+    for path in model.paths.keys() {
+        let (got, want) = (seen.get(path).unwrap_or_else(|| panic!("missing {path:?}")), model.node(path));
         if got != want {
             match (got, want) {
                 (Node::File(g), Node::File(w)) => panic!(
-                    "{k:?}: {} bytes vs model {} bytes, differ at {:?}",
+                    "{path:?}: {} bytes vs model {} bytes, differ at {:?}",
                     g.len(),
                     w.len(),
                     g.iter().zip(w).position(|(a, b)| a != b)
                 ),
-                _ => panic!("{k:?}: kind differs"),
+                _ => panic!("{path:?}: kind differs"),
             }
         }
     }
-    assert_eq!(
-        seen.len(),
-        model.len(),
-        "extra entries: {:?}",
-        seen.keys().filter(|k| !model.contains_key(*k)).collect::<Vec<_>>()
-    );
+    let extra: Vec<_> = seen.keys().filter(|k| !model.paths.contains_key(*k)).collect();
+    assert!(extra.is_empty(), "extra entries: {extra:?}");
 }
 
 fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
@@ -99,38 +131,60 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
     assert!(out.status.success());
 
     let mut rng = Rng(seed | 1);
-    let mut model = Model::new();
-    let mut committed = Model::new();
+    let mut model = Model::default();
+    let mut committed = Model::default();
     // Files whose data changed since the last commit: in-place overwrites survive a crash.
     let mut dirty: HashSet<u64> = HashSet::new();
     let mut w = Writer::open(&p, None).unwrap();
     let names = ["a", "b", "Docs", "photo.jpg", "notes.txt", "x y z", "über", "ÜBER2", "data.bin", "z"];
+    let join = |d: &str, n: &str| if d.is_empty() { n.to_string() } else { format!("{d}/{n}") };
     for step in 0..ops {
-        let dirs: Vec<String> = std::iter::once(String::new())
-            .chain(model.iter().filter(|(_, n)| **n == Node::Dir).map(|(k, _)| k.clone()))
-            .collect();
-        let files: Vec<String> =
-            model.iter().filter(|(_, n)| matches!(n, Node::File(_))).map(|(k, _)| k.clone()).collect();
-        let join = |d: &str, n: &str| if d.is_empty() { n.to_string() } else { format!("{d}/{n}") };
+        let dirs: Vec<String> =
+            std::iter::once(String::new()).chain(model.paths.keys().filter(|k| model.is_dir(k)).cloned()).collect();
+        let files: Vec<String> = model.paths.keys().filter(|k| !model.is_dir(k)).cloned().collect();
+        let all: Vec<String> = model.paths.keys().cloned().collect();
+        let new_name = |rng: &mut Rng| format!("{}{}", rng.pick(&names), rng.below(40));
         match rng.below(100) {
-            0..=19 => {
-                // create a file or directory
-                let d = dirs[rng.below(dirs.len() as u64) as usize].clone();
-                let name = format!("{}{}", names[rng.below(names.len() as u64) as usize], rng.below(40));
+            0..=17 => {
+                let d = rng.pick(&dirs);
+                let name = new_name(&mut rng);
                 let path = join(&d, &name);
-                let exists = model.keys().any(|k| k.to_lowercase() == path.to_lowercase());
+                let exists = model.find_ci(&path).is_some();
                 let dir = rng.below(4) == 0;
                 let pid = ino(&w, &d);
                 let r = w.create(0, pid, &name, if dir { Kind::Dir } else { Kind::File }, 0o644);
                 assert_eq!(r.is_ok(), !exists, "create {path:?}: {r:?}");
                 if r.is_ok() {
-                    model.insert(path, if dir { Node::Dir } else { Node::File(vec![]) });
+                    model.add(path, if dir { Node::Dir } else { Node::File(vec![]) });
                 }
             }
-            20..=49 if !files.is_empty() => {
-                // write somewhere, sometimes far past the end
-                let f = files[rng.below(files.len() as u64) as usize].clone();
-                let Node::File(data) = model.get_mut(&f).unwrap() else { unreachable!() };
+            18..=21 if !files.is_empty() => {
+                // hard link or clone an existing file
+                let src = rng.pick(&files);
+                let d = rng.pick(&dirs);
+                let name = new_name(&mut rng);
+                let path = join(&d, &name);
+                let exists = model.find_ci(&path).is_some();
+                let (sid, pid) = (ino(&w, &src), ino(&w, &d));
+                if rng.below(2) == 0 {
+                    let r = w.link(0, sid, pid, &name);
+                    assert_eq!(r.is_ok(), !exists, "link {src:?} -> {path:?}: {r:?}");
+                    if r.is_ok() {
+                        let id = model.paths[&src];
+                        model.paths.insert(path, id);
+                    }
+                } else {
+                    let r = w.clone_file(0, sid, pid, &name);
+                    assert_eq!(r.is_ok(), !exists, "clone {src:?} -> {path:?}: {r:?}");
+                    if r.is_ok() {
+                        let node = model.node(&src).clone();
+                        model.add(path, node);
+                    }
+                }
+            }
+            22..=49 if !files.is_empty() => {
+                let f = rng.pick(&files);
+                let Node::File(data) = model.objs.get_mut(&model.paths[&f]).unwrap() else { unreachable!() };
                 let off = match rng.below(4) {
                     0 => data.len() as u64,
                     1 => rng.below(data.len() as u64 + 1),
@@ -148,10 +202,9 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 }
                 data[off as usize..end].copy_from_slice(&bytes);
             }
-            50..=59 if !files.is_empty() => {
-                // truncate or extend
-                let f = files[rng.below(files.len() as u64) as usize].clone();
-                let Node::File(data) = model.get_mut(&f).unwrap() else { unreachable!() };
+            50..=58 if !files.is_empty() => {
+                let f = rng.pick(&files);
+                let Node::File(data) = model.objs.get_mut(&model.paths[&f]).unwrap() else { unreachable!() };
                 let size = match rng.below(3) {
                     0 => 0,
                     1 => rng.below(data.len() as u64 + 1),
@@ -162,64 +215,52 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 w.set_size(0, id, size).unwrap();
                 data.resize(size as usize, 0);
             }
-            60..=69 => {
-                // remove a file or an (empty) directory
-                let all: Vec<String> = model.keys().cloned().collect();
-                if all.is_empty() {
-                    continue;
-                }
-                let path = all[rng.below(all.len() as u64) as usize].clone();
+            59..=68 if !all.is_empty() => {
+                let path = rng.pick(&all);
                 let (d, name) = parent_of(&path);
-                let nonempty = model.keys().any(|k| k.starts_with(&format!("{path}/")));
+                let nonempty = model.has_children(&path);
                 let pid = ino(&w, d);
                 let r = w.remove(0, pid, name);
                 assert_eq!(r.is_ok(), !nonempty, "remove {path:?}: {r:?}");
                 if r.is_ok() {
-                    model.remove(&path);
+                    model.unlink(&path);
                 }
             }
-            70..=84 => {
-                // rename/move, sometimes replacing
-                let all: Vec<String> = model.keys().cloned().collect();
-                if all.is_empty() {
-                    continue;
-                }
-                let src = all[rng.below(all.len() as u64) as usize].clone();
-                let d = dirs[rng.below(dirs.len() as u64) as usize].clone();
-                let name = format!("{}{}", names[rng.below(names.len() as u64) as usize], rng.below(40));
+            69..=84 if !all.is_empty() => {
+                let src = rng.pick(&all);
+                let d = rng.pick(&dirs);
+                let name = new_name(&mut rng);
                 let dst = join(&d, &name);
                 if dst == src || dst.starts_with(&format!("{src}/")) {
                     continue; // into itself
                 }
-                let target = model.keys().find(|k| k.to_lowercase() == dst.to_lowercase()).cloned();
+                let target = model.find_ci(&dst);
                 let replace = rng.below(2) == 0;
                 let (sd, sn) = parent_of(&src);
                 let (spid, dpid) = (ino(&w, sd), ino(&w, &d));
                 let r = w.rename(0, spid, sn, dpid, &name, replace);
+                let same_obj = target.as_ref().is_some_and(|t| t != &src && model.paths[t] == model.paths[&src]);
                 let expect_ok = match &target {
                     None => true,
-                    Some(t) if t == &src => true,
-                    Some(t) => {
-                        replace
-                            && (model[t] == Node::Dir) == (model[&src] == Node::Dir)
-                            && !model.keys().any(|k| k.starts_with(&format!("{t}/")))
-                    }
+                    Some(t) if t == &src || same_obj => true,
+                    Some(t) => replace && model.is_dir(t) == model.is_dir(&src) && !model.has_children(t),
                 };
                 assert_eq!(r.is_ok(), expect_ok, "rename {src:?} -> {dst:?} (target {target:?}): {r:?}");
-                if r.is_ok() {
+                if r.is_ok() && !same_obj {
                     if let Some(t) = &target
                         && t != &src
                     {
-                        model.remove(t);
+                        model.unlink(t);
                     }
-                    let moved: Vec<(String, Node)> = model
+                    let moved: Vec<(String, u64)> = model
+                        .paths
                         .iter()
                         .filter(|(k, _)| **k == src || k.starts_with(&format!("{src}/")))
-                        .map(|(k, n)| (k.clone(), n.clone()))
+                        .map(|(k, id)| (k.clone(), *id))
                         .collect();
-                    for (k, n) in moved {
-                        model.remove(&k);
-                        model.insert(format!("{dst}{}", &k[src.len()..]), n);
+                    for (k, id) in moved {
+                        model.paths.remove(&k);
+                        model.paths.insert(format!("{dst}{}", &k[src.len()..]), id);
                     }
                 }
             }
@@ -240,9 +281,10 @@ fn run(seed: u64, ops: usize, mib: u64, crashes: bool) {
                 model = committed.clone();
                 // Metadata rolls back; data overwritten in place may not. Sizes must match the commit.
                 let view = w.view(0).unwrap();
-                for (path, node) in model.iter_mut() {
-                    if let Node::File(want) = node {
-                        let inode = view.lookup(path).unwrap();
+                for path in model.paths.keys().cloned().collect::<Vec<_>>() {
+                    let id = model.paths[&path];
+                    if let Node::File(want) = model.objs.get_mut(&id).unwrap() {
+                        let inode = view.lookup(&path).unwrap();
                         let got = view.open(&inode).unwrap().read_all().unwrap();
                         assert_eq!(got.len(), want.len(), "{path:?} size after crash");
                         if &got != want {
@@ -290,6 +332,6 @@ fn stress_no_crashes() {
 
 #[test]
 fn stress_small_disk() {
-    // A small container exercises the free-queue limits and full-disk handling.
+    // A small container exercises the free-queue limits.
     run(777, 1500, 24, true);
 }

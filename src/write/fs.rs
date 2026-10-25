@@ -41,6 +41,10 @@ const S_IFLNK: u16 = 0o120000;
 /// uid/gid macOS gives files on external drives ("unknown"), so any Mac user can use them.
 const UNKNOWN_ID: u32 = 99;
 const APFS_KIND_NEW: u64 = 1;
+const PEXT_LEN_MASK: u64 = 0x0fff_ffff_ffff_ffff;
+const T_SIBLING_LINK: u64 = 5;
+const T_SIBLING_MAP: u64 = 12;
+const DREC_EXT_TYPE_SIBLING_ID: u8 = 1;
 
 /// What `create` makes.
 pub enum Kind {
@@ -232,9 +236,7 @@ impl Writer {
     /// Creates a file, directory or symlink named `name` in directory `parent`. Returns its inode id.
     pub fn create(&mut self, v: usize, parent: u64, name: &str, kind: Kind, perm: u16) -> io::Result<u64> {
         self.writable(v)?;
-        if name.is_empty() || name.len() > 255 || name.contains(['/', '\0']) || name == "." || name == ".." {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid file name {name:?}")));
-        }
+        check_name(name)?;
         let mut p = self.inode_rec(v, parent)?;
         if p.mode() & S_IFMT != S_IFDIR {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "parent is not a directory"));
@@ -327,8 +329,9 @@ impl Writer {
         Ok(out)
     }
 
-    /// Rewrites a data stream's extent records (and extent-reference records) from `old` to `new`,
-    /// freeing blocks that are no longer used.
+    /// Rewrites a data stream's extent records from `old` to `new`, then updates the extent-reference
+    /// tree by block ranges: ranges no longer used lose a reference (and are freed at zero), new ranges
+    /// gain records.
     fn sync_extents(&mut self, v: usize, dstream: u64, old: &[Ext], new: &[Ext]) -> io::Result<()> {
         let fkey = |l: u64| {
             let mut k = key(dstream, T_FILE_EXTENT);
@@ -349,42 +352,140 @@ impl Writer {
             }
         }
         let bs = self.c.block_size;
-        let phys = |list: &[Ext]| -> BTreeMap<u64, u64> {
-            list.iter().filter(|e| e.phys != 0).map(|e| (e.phys, e.len / bs)).collect()
+        let ranges = |list: &[Ext]| -> Vec<(u64, u64)> {
+            list.iter().filter(|e| e.phys != 0).map(|e| (e.phys, e.phys + e.len / bs)).collect()
         };
-        let (old_p, new_p) = (phys(old), phys(new));
-        for p in old_p.keys().filter(|p| !new_p.contains_key(p)) {
-            self.tree_del(TreeId::ExtentRef(v), &key(*p, T_PHYS_EXT))?;
+        let (o, n) = (ranges(old), ranges(new));
+        for (s, e) in subtract(&o, &n) {
+            self.adjust_refs(v, s, e - s, -1)?;
         }
-        for (p, n) in &new_p {
-            if old_p.get(p) != Some(n) {
-                let mut val = vec![0u8; 20];
-                put64(&mut val, 0, n | APFS_KIND_NEW << 60);
-                put64(&mut val, 8, dstream);
-                put32(&mut val, 16, 1);
-                self.tree_put(TreeId::ExtentRef(v), &key(*p, T_PHYS_EXT), &val)?;
-            }
-        }
-        // Free blocks covered by old ranges but not new ones.
-        for (&p, &n) in &old_p {
-            let mut gaps = vec![(p, p + n)];
-            for (&q, &m) in new_p.range(..p + n) {
-                let (qs, qe) = (q, q + m);
-                gaps = gaps
-                    .into_iter()
-                    .flat_map(
-                        |(s, e)| {
-                            if qe <= s || qs >= e { vec![(s, e)] } else { vec![(s, qs.max(s)), (qe.min(e), e)] }
-                        },
-                    )
-                    .filter(|(s, e)| s < e)
-                    .collect();
-            }
-            for (s, e) in gaps {
-                self.free(Some(v), s, e - s)?;
-            }
+        for (s, e) in subtract(&n, &o) {
+            self.acquire(v, dstream, s, e - s)?;
         }
         Ok(())
+    }
+
+    /// The physical-extent record covering block `phys`, as (start, blocks, raw value).
+    fn pext_at(&self, v: usize, phys: u64) -> io::Result<Option<(u64, u64, Vec<u8>)>> {
+        Ok(self.tree_floor(TreeId::ExtentRef(v), &key(phys, T_PHYS_EXT))?.and_then(|(k, val)| {
+            let (start, len) = (u64le(&k, 0) & OBJ_ID_MASK, u64le(&val, 0) & PEXT_LEN_MASK);
+            (u64le(&k, 0) >> 60 == T_PHYS_EXT && phys < start + len).then_some((start, len, val))
+        }))
+    }
+
+    fn put_pext(&mut self, v: usize, start: u64, len: u64, template: &[u8], refcnt: u32) -> io::Result<()> {
+        let mut val = template.to_vec();
+        put64(&mut val, 0, len | (u64le(template, 0) & !PEXT_LEN_MASK));
+        put32(&mut val, 16, refcnt);
+        self.tree_put(TreeId::ExtentRef(v), &key(start, T_PHYS_EXT), &val).map(|_| ())
+    }
+
+    /// Adds `delta` to the reference count of blocks [s, s+n), splitting records at the range edges.
+    /// Blocks whose count reaches zero are freed.
+    fn adjust_refs(&mut self, v: usize, s: u64, n: u64, delta: i64) -> io::Result<()> {
+        let end = s + n;
+        let mut pos = s;
+        while pos < end {
+            let Some((rs, rlen, val)) = self.pext_at(v, pos)? else {
+                // No record: the block was exclusively owned without bookkeeping; drop it on release.
+                if delta < 0 {
+                    self.free(Some(v), pos, 1)?;
+                }
+                pos += 1;
+                continue;
+            };
+            let (re, oe) = (rs + rlen, end.min(rs + rlen));
+            let refcnt = u32le(&val, 16) as i64;
+            self.tree_del(TreeId::ExtentRef(v), &key(rs, T_PHYS_EXT))?;
+            if rs < pos {
+                self.put_pext(v, rs, pos - rs, &val, refcnt as u32)?;
+            }
+            if refcnt + delta > 0 {
+                self.put_pext(v, pos, oe - pos, &val, (refcnt + delta) as u32)?;
+            } else {
+                self.free(Some(v), pos, oe - pos)?;
+            }
+            if oe < re {
+                self.put_pext(v, oe, re - oe, &val, refcnt as u32)?;
+            }
+            pos = oe;
+        }
+        Ok(())
+    }
+
+    /// Records freshly allocated blocks [s, s+n) as owned by `dstream`, extending the previous
+    /// record when it ends right there.
+    fn acquire(&mut self, v: usize, dstream: u64, s: u64, n: u64) -> io::Result<()> {
+        let mut val = vec![0u8; 20];
+        put64(&mut val, 0, APFS_KIND_NEW << 60);
+        put64(&mut val, 8, dstream);
+        if let Some(prev) = s.checked_sub(1)
+            && let Some((ps, plen, pval)) = self.pext_at(v, prev)?
+            && ps + plen == s
+            && pval == {
+                let mut t = val.clone();
+                put64(&mut t, 0, plen | APFS_KIND_NEW << 60);
+                put32(&mut t, 16, 1);
+                t
+            }
+        {
+            return self.put_pext(v, ps, plen + n, &pval, 1);
+        }
+        self.put_pext(v, s, n, &val, 1)
+    }
+
+    /// True if any block of [s, s+n) is referenced more than once (shared with a clone).
+    fn shared(&self, v: usize, s: u64, n: u64) -> io::Result<bool> {
+        let mut pos = s;
+        while pos < s + n {
+            match self.pext_at(v, pos)? {
+                Some((rs, rlen, val)) => {
+                    if u32le(&val, 16) > 1 {
+                        return Ok(true);
+                    }
+                    pos = rs + rlen;
+                }
+                None => pos += 1,
+            }
+        }
+        Ok(false)
+    }
+
+    fn dstream_refs(&self, v: usize, dstream: u64) -> io::Result<u32> {
+        Ok(self.tree_get(TreeId::Fs(v), &key(dstream, T_DSTREAM_ID))?.map_or(0, |r| u32le(&r, 0)))
+    }
+
+    /// Gives a cloned inode its own data stream: same blocks, one more reference each.
+    fn unshare_dstream(&mut self, v: usize, ino: u64, rec: &mut InodeRec) -> io::Result<()> {
+        let private = rec.u64(8);
+        let refs = self.dstream_refs(v, private)?;
+        if refs <= 1 {
+            return Ok(());
+        }
+        let exts = self.extents(v, private)?;
+        let new_id = if private != ino && self.dstream_refs(v, ino)? == 0 && self.extents(v, ino)?.is_empty() {
+            ino
+        } else {
+            let id = u64le(&self.vols[v].sb, 176);
+            self.vol_add(v, 176, 1);
+            id
+        };
+        let bs = self.c.block_size;
+        for e in &exts {
+            let mut k = key(new_id, T_FILE_EXTENT);
+            k.extend(e.logical.to_le_bytes());
+            let mut val = vec![0u8; 24];
+            put64(&mut val, 0, e.len);
+            put64(&mut val, 8, e.phys);
+            self.tree_put(TreeId::Fs(v), &k, &val)?;
+            if e.phys != 0 {
+                self.adjust_refs(v, e.phys, e.len / bs, 1)?;
+            }
+        }
+        self.tree_put(TreeId::Fs(v), &key(new_id, T_DSTREAM_ID), &1u32.to_le_bytes())?;
+        self.tree_put(TreeId::Fs(v), &key(private, T_DSTREAM_ID), &(refs - 1).to_le_bytes())?;
+        rec.set_u64(8, new_id);
+        self.put_inode(v, ino, rec)
     }
 
     /// Opens a regular file's data for modification: undoes compression, returns its record and extents.
@@ -395,8 +496,7 @@ impl Writer {
             return Err(io::Error::new(io::ErrorKind::IsADirectory, "not a regular file"));
         }
         if rec.u64(48) & (INODE_WAS_CLONED | INODE_WAS_EVER_CLONED) != 0 {
-            // shortcut: cloned files share blocks; writing them needs block-level copy-on-write.
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "writing cloned files isn't supported yet"));
+            self.unshare_dstream(v, ino, &mut rec)?;
         }
         if u32le(&rec.fixed, 68) & UF_COMPRESSED != 0 {
             let data = {
@@ -495,26 +595,44 @@ impl Writer {
         }
         split_at(&mut exts, b0, bs);
         split_at(&mut exts, b1, bs);
-        let mut i = 0;
-        while i < exts.len() {
-            let e = exts[i];
-            if e.phys == 0 && e.logical >= b0 && e.logical + e.len <= b1 {
-                let (start, n) = self.alloc(Some(v), e.len / bs)?;
-                let got = n * bs;
-                exts[i] = Ext { logical: e.logical, len: got, phys: start };
-                if got < e.len {
-                    exts.insert(i + 1, Ext { logical: e.logical + got, len: e.len - got, phys: 0 });
-                }
-                // Fresh blocks: fill the parts outside the write with zeros.
-                let mut buf = vec![0u8; got as usize];
+        let cloned = rec.u64(48) & (INODE_WAS_CLONED | INODE_WAS_EVER_CLONED) != 0;
+        let mut out = Vec::with_capacity(exts.len() + 2);
+        for e in exts {
+            let inside = e.logical >= b0 && e.logical + e.len <= b1;
+            if inside && e.phys == 0 {
+                // A hole: fresh blocks, zero outside the written bytes.
+                let mut buf = vec![0u8; e.len as usize];
                 copy_overlap(&mut buf, e.logical, off, data);
-                self.c.dev.write_at(start * bs, &buf)?;
-            } else if e.phys != 0 && e.logical < end && e.logical + e.len > off {
-                self.overwrite(e, off, data)?;
+                out.extend(self.alloc_write(v, e.logical, &buf)?);
+            } else if inside && cloned && self.shared(v, e.phys, e.len / bs)? {
+                // Blocks shared with a clone: copy, patch, write elsewhere.
+                let mut buf = vec![0u8; e.len as usize];
+                self.c.dev.read_at(e.phys * bs, &mut buf)?;
+                copy_overlap(&mut buf, e.logical, off, data);
+                out.extend(self.alloc_write(v, e.logical, &buf)?);
+            } else {
+                if inside {
+                    self.overwrite(e, off, data)?;
+                }
+                out.push(e);
             }
-            i += 1;
         }
-        self.finish_data(v, ino, rec, &old, exts, size.max(end))
+        self.finish_data(v, ino, rec, &old, out, size.max(end))
+    }
+
+    /// Writes `buf` (whole blocks of file data starting at `logical`) to newly allocated blocks.
+    fn alloc_write(&mut self, v: usize, logical: u64, buf: &[u8]) -> io::Result<Vec<Ext>> {
+        let bs = self.c.block_size;
+        let mut out = vec![];
+        let mut done = 0u64;
+        while done < buf.len() as u64 {
+            let (start, n) = self.alloc(Some(v), (buf.len() as u64 - done) / bs)?;
+            let len = n * bs;
+            self.c.dev.write_at(start * bs, &buf[done as usize..(done + len) as usize])?;
+            out.push(Ext { logical: logical + done, len, phys: start });
+            done += len;
+        }
+        Ok(out)
     }
 
     /// In-place write into an existing extent; partial blocks are read, patched and written back.
@@ -585,16 +703,31 @@ impl Writer {
         let e = self
             .find_entry(v, parent, name)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name:?} not found")))?;
-        let rec = self.inode_rec(v, e.id)?;
+        let mut rec = self.inode_rec(v, e.id)?;
         let is_dir = rec.mode() & S_IFMT == S_IFDIR;
         if is_dir && rec.nlink() != 0 {
             return Err(io::Error::new(io::ErrorKind::DirectoryNotEmpty, format!("{name:?} is not empty")));
         }
-        if !is_dir && rec.nlink() > 1 {
-            // shortcut: hard links need sibling records kept in sync; refuse rather than corrupt them.
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "removing hard-linked files isn't supported yet"));
-        }
         self.tree_del(TreeId::Fs(v), &e.key)?;
+        if let Some(sib) = sibling_of(&e.val) {
+            self.tree_del(TreeId::Fs(v), &sibling_key(e.id, sib))?;
+            self.tree_del(TreeId::Fs(v), &key(sib, T_SIBLING_MAP))?;
+        }
+        let links = if is_dir { 1 } else { rec.nlink() };
+        if links > 1 {
+            // Other hard links remain: drop this one and make the lowest remaining sibling primary.
+            rec.set_nlink(links - 1);
+            if let Some((_, parent_id, name)) = self.siblings(v, e.id)?.into_iter().next() {
+                rec.set_u64(0, parent_id);
+                rec.set(INO_NAME, XF_DO_NOT_COPY, cstr0(&name));
+            }
+            rec.set_u64(32, now());
+            self.put_inode(v, e.id, &rec)?;
+            let mut p = self.inode_rec(v, parent)?;
+            p.set_nlink(p.nlink() - 1);
+            p.touch(now());
+            return self.put_inode(v, parent, &p);
+        }
         self.delete_inode(v, e.id, &rec)?;
         let mut p = self.inode_rec(v, parent)?;
         p.set_nlink(p.nlink() - 1);
@@ -620,11 +753,113 @@ impl Writer {
             self.remove_xattr(v, id, &name)?;
         }
         let private = rec.u64(8);
-        let exts = self.extents(v, private)?;
-        self.sync_extents(v, private, &exts, &[])?;
-        self.tree_del(TreeId::Fs(v), &key(private, T_DSTREAM_ID))?;
+        let refs = self.dstream_refs(v, private)?;
+        if refs > 1 {
+            // A clone still uses this data stream.
+            self.tree_put(TreeId::Fs(v), &key(private, T_DSTREAM_ID), &(refs - 1).to_le_bytes())?;
+        } else {
+            let exts = self.extents(v, private)?;
+            self.sync_extents(v, private, &exts, &[])?;
+            self.tree_del(TreeId::Fs(v), &key(private, T_DSTREAM_ID))?;
+        }
+        for (sib, _, _) in self.siblings(v, id)? {
+            self.tree_del(TreeId::Fs(v), &sibling_key(id, sib))?;
+            self.tree_del(TreeId::Fs(v), &key(sib, T_SIBLING_MAP))?;
+        }
         self.tree_del(TreeId::Fs(v), &key(id, T_INODE))?;
         Ok(())
+    }
+
+    /// Hard-link siblings of an inode: (sibling id, parent, name), lowest id (the primary link) first.
+    fn siblings(&self, v: usize, ino: u64) -> io::Result<Vec<(u64, u64, String)>> {
+        let mut out = vec![];
+        self.view(v)?.records(ino, T_SIBLING_LINK as u8, &mut |k, val| {
+            let name_len = u16le(val, 8) as usize;
+            let name = String::from_utf8_lossy(&val[10..10 + name_len.saturating_sub(1)]).into_owned();
+            out.push((u64le(k, 8), u64le(val, 0), name));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    fn put_sibling(&mut self, v: usize, ino: u64, sib: u64, parent: u64, name: &str) -> io::Result<()> {
+        let mut val = parent.to_le_bytes().to_vec();
+        val.extend((name.len() as u16 + 1).to_le_bytes());
+        val.extend(cstr0(name));
+        self.tree_put(TreeId::Fs(v), &sibling_key(ino, sib), &val)?;
+        self.tree_put(TreeId::Fs(v), &key(sib, T_SIBLING_MAP), &ino.to_le_bytes()).map(|_| ())
+    }
+
+    fn new_obj_id(&mut self, v: usize) -> u64 {
+        let id = u64le(&self.vols[v].sb, 176);
+        self.vol_add(v, 176, 1);
+        id
+    }
+
+    /// Adds a hard link `new_parent/new_name` to the existing file `ino`.
+    pub fn link(&mut self, v: usize, ino: u64, new_parent: u64, new_name: &str) -> io::Result<()> {
+        self.writable(v)?;
+        check_name(new_name)?;
+        let mut rec = self.inode_rec(v, ino)?;
+        if rec.mode() & S_IFMT == S_IFDIR {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "can't hard-link a directory"));
+        }
+        if self.find_entry(v, new_parent, new_name)?.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{new_name:?} already exists")));
+        }
+        // The first extra link gives the existing one a sibling record too.
+        if self.siblings(v, ino)?.is_empty() {
+            let (parent, name) = (rec.u64(0), cstr_of(rec.get(INO_NAME).map_or(&[][..], |n| n)));
+            let e = self.find_entry(v, parent, &name)?.ok_or_else(|| bad("primary link not found"))?;
+            let sib = self.new_obj_id(v);
+            self.tree_put(TreeId::Fs(v), &e.key, &with_sibling(&e.val, sib))?;
+            self.put_sibling(v, ino, sib, parent, &name)?;
+        }
+        let sib = self.new_obj_id(v);
+        self.put_sibling(v, ino, sib, new_parent, new_name)?;
+        let mut dval = vec![0u8; 18];
+        put64(&mut dval, 0, ino);
+        put64(&mut dval, 8, now());
+        let dtype = if rec.mode() & S_IFMT == S_IFLNK { 10u16 } else { 8 };
+        dval[16..18].copy_from_slice(&dtype.to_le_bytes());
+        let dkey = self.drec_key(v, new_parent, new_name);
+        self.tree_put(TreeId::Fs(v), &dkey, &with_sibling(&dval, sib))?;
+        rec.set_nlink(rec.nlink() + 1);
+        rec.set_u64(32, now());
+        self.put_inode(v, ino, &rec)?;
+        let mut p = self.inode_rec(v, new_parent)?;
+        p.set_nlink(p.nlink() + 1);
+        p.touch(now());
+        self.put_inode(v, new_parent, &p)
+    }
+
+    /// APFS clone: a new file sharing `src`'s data blocks until either side is written.
+    pub fn clone_file(&mut self, v: usize, src: u64, parent: u64, name: &str) -> io::Result<u64> {
+        let mut s = self.inode_rec(v, src)?;
+        if s.mode() & S_IFMT != S_IFREG {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "only regular files can be cloned"));
+        }
+        if u32le(&s.fixed, 68) & UF_COMPRESSED != 0 {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "cloning compressed files isn't supported"));
+        }
+        let ino = self.create(v, parent, name, Kind::File, s.mode() & 0o7777)?;
+        let Some(ds) = s.get(INO_DSTREAM).cloned() else { return Ok(ino) };
+        let private = s.u64(8);
+        let refs = self.dstream_refs(v, private)?;
+        self.tree_put(TreeId::Fs(v), &key(private, T_DSTREAM_ID), &(refs + 1).to_le_bytes())?;
+        let flags = INODE_WAS_CLONED | INODE_WAS_EVER_CLONED;
+        let mut c = self.inode_rec(v, ino)?;
+        c.set_u64(8, private);
+        c.set_u64(48, c.u64(48) | flags);
+        c.set(INO_DSTREAM, XF_SYSTEM_FIELD, ds);
+        if let Some(sp) = s.get(INO_SPARSE_BYTES).cloned() {
+            c.set(INO_SPARSE_BYTES, XF_SYSTEM_FIELD | XF_CHILDREN_INHERIT, sp);
+            c.set_u64(48, c.u64(48) | INODE_IS_SPARSE);
+        }
+        self.put_inode(v, ino, &c)?;
+        s.set_u64(48, s.u64(48) | flags);
+        self.put_inode(v, src, &s)?;
+        Ok(ino)
     }
 
     /// Moves/renames an entry. An existing target is replaced only if `replace` (directories must be empty).
@@ -638,13 +873,18 @@ impl Writer {
         replace: bool,
     ) -> io::Result<()> {
         self.writable(v)?;
-        if new_name.is_empty() || new_name.len() > 255 || new_name.contains(['/', '\0']) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid file name {new_name:?}")));
-        }
+        check_name(new_name)?;
         let src = self
             .find_entry(v, parent, name)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name:?} not found")))?;
-        if let Some(dst) = self.find_entry(v, new_parent, new_name)?
+        let dst = self.find_entry(v, new_parent, new_name)?;
+        if let Some(d) = &dst
+            && d.id == src.id
+            && d.key != src.key
+        {
+            return Ok(()); // both names are links to the same file: POSIX says do nothing
+        }
+        if let Some(dst) = dst
             && dst.id != src.id
         {
             if !replace {
@@ -667,10 +907,18 @@ impl Writer {
         self.tree_del(TreeId::Fs(v), &src.key)?;
         let dkey = self.drec_key(v, new_parent, new_name);
         self.tree_put(TreeId::Fs(v), &dkey, &src.val)?;
-        rec.set_u64(0, new_parent);
-        let mut name0 = new_name.as_bytes().to_vec();
-        name0.push(0);
-        rec.set(INO_NAME, XF_DO_NOT_COPY, name0);
+        // The inode carries the primary link's name and parent; other hard links only their sibling record.
+        let primary = match sibling_of(&src.val) {
+            Some(sib) => {
+                self.put_sibling(v, src.id, sib, new_parent, new_name)?;
+                self.siblings(v, src.id)?.first().is_some_and(|f| f.0 == sib)
+            }
+            None => true,
+        };
+        if primary {
+            rec.set_u64(0, new_parent);
+            rec.set(INO_NAME, XF_DO_NOT_COPY, cstr0(new_name));
+        }
         rec.set_u64(32, now);
         self.put_inode(v, src.id, &rec)?;
         let mut p = self.inode_rec(v, parent)?;
@@ -741,6 +989,62 @@ impl Writer {
         rec.set_u64(32, now());
         self.put_inode(v, ino, &rec)
     }
+}
+
+fn check_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name.len() > 255 || name.contains(['/', '\0']) || name == "." || name == ".." {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid file name {name:?}")));
+    }
+    Ok(())
+}
+
+fn cstr0(name: &str) -> Vec<u8> {
+    let mut b = name.as_bytes().to_vec();
+    b.push(0);
+    b
+}
+
+fn cstr_of(b: &[u8]) -> String {
+    String::from_utf8_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]).into_owned()
+}
+
+fn sibling_key(ino: u64, sib: u64) -> Vec<u8> {
+    let mut k = key(ino, T_SIBLING_LINK);
+    k.extend(sib.to_le_bytes());
+    k
+}
+
+/// The sibling id stored in a directory entry's xfield, if it is a hard link.
+fn sibling_of(drec_val: &[u8]) -> Option<u64> {
+    (drec_val.len() >= 34 && drec_val[22] == DREC_EXT_TYPE_SIBLING_ID).then(|| u64le(drec_val, 26))
+}
+
+/// A directory-entry value carrying a sibling-id xfield.
+fn with_sibling(drec_val: &[u8], sib: u64) -> Vec<u8> {
+    let mut v = drec_val[..18].to_vec();
+    v.extend(1u16.to_le_bytes()); // one xfield
+    v.extend(8u16.to_le_bytes()); // 8 bytes of xfield data
+    v.extend([DREC_EXT_TYPE_SIBLING_ID, XF_DO_NOT_COPY]);
+    v.extend(8u16.to_le_bytes());
+    v.extend(sib.to_le_bytes());
+    v
+}
+
+/// Parts of the ranges in `a` not covered by any range in `b` (half-open block ranges).
+fn subtract(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = vec![];
+    for &(s, e) in a {
+        let mut parts = vec![(s, e)];
+        for &(bs, be) in b {
+            parts = parts
+                .into_iter()
+                .flat_map(|(s, e)| if be <= s || bs >= e { vec![(s, e)] } else { vec![(s, bs.max(s)), (be.min(e), e)] })
+                .filter(|(s, e)| s < e)
+                .collect();
+        }
+        out.extend(parts);
+    }
+    out
 }
 
 /// Splits the extent containing byte `at` (block aligned) so an extent starts exactly there.

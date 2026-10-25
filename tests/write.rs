@@ -237,3 +237,67 @@ fn big_container_with_cabs() {
     assert_eq!(read(&p, "big.bin"), &data[..1 << 20]);
     fsck(&p);
 }
+
+#[test]
+fn hard_links() {
+    let p = fresh("links", 64, &["-L", "Links"]);
+    let mut w = Writer::open(&p, None).unwrap();
+    let d = w.create(0, 2, "d", Kind::Dir, 0o755).unwrap();
+    let f = w.create(0, 2, "orig.txt", Kind::File, 0o644).unwrap();
+    w.write_at(0, f, 0, b"shared contents").unwrap();
+    w.link(0, f, d, "link1.txt").unwrap();
+    w.link(0, f, 2, "link2.txt").unwrap();
+    w.commit().unwrap();
+    fsck(&p);
+    assert_eq!(read(&p, "d/link1.txt"), b"shared contents");
+    // Writes through one name show through the others.
+    w.write_at(0, f, 0, b"SHARED").unwrap();
+    // Remove the primary link, rename another.
+    w.remove(0, 2, "orig.txt").unwrap();
+    w.rename(0, d, "link1.txt", 2, "renamed.txt", false).unwrap();
+    w.commit().unwrap();
+    drop(w);
+    fsck(&p);
+    assert_eq!(read(&p, "renamed.txt"), b"SHARED contents");
+    assert_eq!(read(&p, "link2.txt"), b"SHARED contents");
+    let mut w = Writer::open(&p, None).unwrap();
+    w.remove(0, 2, "renamed.txt").unwrap();
+    w.remove(0, 2, "link2.txt").unwrap();
+    w.commit().unwrap();
+    drop(w);
+    fsck(&p);
+}
+
+#[test]
+fn clones_share_until_written() {
+    let p = fresh("clones", 64, &["-L", "Clones"]);
+    let mut w = Writer::open(&p, None).unwrap();
+    let f = w.create(0, 2, "orig.bin", Kind::File, 0o644).unwrap();
+    let data = pattern(300_000, 2);
+    w.write_at(0, f, 0, &data).unwrap();
+    w.commit().unwrap();
+    let free_before = w.free_blocks();
+    let c = w.clone_file(0, f, 2, "copy.bin").unwrap();
+    w.commit().unwrap();
+    // Cloning costs metadata only.
+    let used = free_before.saturating_sub(w.free_blocks());
+    assert!(used < 40, "clone used {used} blocks"); // data is 74 blocks; a commit copies ~10 metadata blocks
+    fsck(&p);
+    // Write to the clone: copy-on-write, the original is untouched.
+    w.write_at(0, c, 5000, b"clone edit").unwrap();
+    w.commit().unwrap();
+    fsck(&p);
+    let mut edited = data.clone();
+    edited[5000..5010].copy_from_slice(b"clone edit");
+    assert_eq!(read(&p, "orig.bin"), data);
+    assert_eq!(read(&p, "copy.bin"), edited);
+    // Truncate the original, then delete it: the clone keeps its blocks.
+    w.set_size(0, f, 1000).unwrap();
+    w.commit().unwrap();
+    fsck(&p);
+    w.remove(0, 2, "orig.bin").unwrap();
+    w.commit().unwrap();
+    drop(w);
+    fsck(&p);
+    assert_eq!(read(&p, "copy.bin"), edited);
+}
