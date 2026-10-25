@@ -238,7 +238,7 @@ impl Writer {
     }
 
     /// Creates a file, directory or symlink named `name` in directory `parent`. Returns its inode id.
-    pub fn create(&mut self, v: usize, parent: u64, name: &str, kind: Kind, perm: u16) -> io::Result<u64> {
+    fn do_create(&mut self, v: usize, parent: u64, name: &str, kind: Kind, perm: u16) -> io::Result<u64> {
         self.writable(v)?;
         check_name(name)?;
         let mut p = self.inode_rec(v, parent)?;
@@ -528,7 +528,7 @@ impl Writer {
                 put64(d, 8, 0);
             });
             self.put_inode(v, ino, &rec)?;
-            self.write_at(v, ino, 0, &data)?;
+            self.do_write_at(v, ino, 0, &data)?;
             rec = self.inode_rec(v, ino)?;
         }
         let exts = self.extents(v, rec.u64(8))?;
@@ -586,7 +586,7 @@ impl Writer {
     }
 
     /// Writes `data` at byte `off` of regular file `ino`, growing it as needed.
-    pub fn write_at(&mut self, v: usize, ino: u64, off: u64, data: &[u8]) -> io::Result<()> {
+    fn do_write_at(&mut self, v: usize, ino: u64, off: u64, data: &[u8]) -> io::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -685,7 +685,7 @@ impl Writer {
     }
 
     /// Sets a regular file's size. Growing adds a hole; shrinking frees the blocks past the end.
-    pub fn set_size(&mut self, v: usize, ino: u64, new_size: u64) -> io::Result<()> {
+    fn do_set_size(&mut self, v: usize, ino: u64, new_size: u64) -> io::Result<()> {
         let (rec, old) = self.data_rec(v, ino)?;
         let bs = self.c.block_size;
         let size = rec.get(INO_DSTREAM).map_or(0, |d| u64le(d, 0));
@@ -709,7 +709,7 @@ impl Writer {
     }
 
     /// Removes the entry `name` from `parent`; deletes the inode when its last link goes.
-    pub fn remove(&mut self, v: usize, parent: u64, name: &str) -> io::Result<()> {
+    fn do_remove(&mut self, v: usize, parent: u64, name: &str) -> io::Result<()> {
         self.writable(v)?;
         let e = self
             .find_entry(v, parent, name)?
@@ -812,7 +812,7 @@ impl Writer {
     }
 
     /// Adds a hard link `new_parent/new_name` to the existing file `ino`.
-    pub fn link(&mut self, v: usize, ino: u64, new_parent: u64, new_name: &str) -> io::Result<()> {
+    fn do_link(&mut self, v: usize, ino: u64, new_parent: u64, new_name: &str) -> io::Result<()> {
         self.writable(v)?;
         check_name(new_name)?;
         let mut rec = self.inode_rec(v, ino)?;
@@ -849,7 +849,7 @@ impl Writer {
     }
 
     /// APFS clone: a new file sharing `src`'s data blocks until either side is written.
-    pub fn clone_file(&mut self, v: usize, src: u64, parent: u64, name: &str) -> io::Result<u64> {
+    fn do_clone_file(&mut self, v: usize, src: u64, parent: u64, name: &str) -> io::Result<u64> {
         let mut s = self.inode_rec(v, src)?;
         if s.mode() & S_IFMT != S_IFREG {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "only regular files can be cloned"));
@@ -857,7 +857,7 @@ impl Writer {
         if u32le(&s.fixed, 68) & UF_COMPRESSED != 0 {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "cloning compressed files isn't supported"));
         }
-        let ino = self.create(v, parent, name, Kind::File, s.mode() & 0o7777)?;
+        let ino = self.do_create(v, parent, name, Kind::File, s.mode() & 0o7777)?;
         let Some(ds) = s.get(INO_DSTREAM).cloned() else { return Ok(ino) };
         let private = s.u64(8);
         let refs = self.dstream_refs(v, private)?;
@@ -880,7 +880,7 @@ impl Writer {
     }
 
     /// Moves/renames an entry. An existing target is replaced only if `replace` (directories must be empty).
-    pub fn rename(
+    fn do_rename(
         &mut self,
         v: usize,
         parent: u64,
@@ -914,7 +914,7 @@ impl Writer {
                     "can't replace a file with a directory or back",
                 ));
             }
-            self.remove(v, new_parent, new_name)?;
+            self.do_remove(v, new_parent, new_name)?;
         }
         let mut rec = self.inode_rec(v, src.id)?;
         if rec.mode() & S_IFMT == S_IFDIR && self.is_ancestor(v, src.id, new_parent)? {
@@ -1010,8 +1010,7 @@ impl Writer {
     }
 
     /// Turns on size tracking ("directory statistics") for an empty directory, as macOS can.
-    #[doc(hidden)]
-    pub fn enable_dir_stats(&mut self, v: usize, dir: u64) -> io::Result<()> {
+    fn do_enable_dir_stats(&mut self, v: usize, dir: u64) -> io::Result<()> {
         self.writable(v)?;
         let mut rec = self.inode_rec(v, dir)?;
         if rec.mode() & S_IFMT != S_IFDIR || rec.nlink() != 0 || dirstat_of(&rec).is_some() {
@@ -1039,7 +1038,7 @@ impl Writer {
     }
 
     /// Sets timestamps (nanoseconds since 1970); `None` leaves one unchanged.
-    pub fn set_times(
+    fn do_set_times(
         &mut self,
         v: usize,
         ino: u64,
@@ -1059,7 +1058,7 @@ impl Writer {
     }
 
     /// Sets the permission bits (the file type bits are kept).
-    pub fn set_mode(&mut self, v: usize, ino: u64, perm: u16) -> io::Result<()> {
+    fn do_set_mode(&mut self, v: usize, ino: u64, perm: u16) -> io::Result<()> {
         self.writable(v)?;
         let mut rec = self.inode_rec(v, ino)?;
         let mode = rec.mode() & S_IFMT | perm & 0o7777;
@@ -1069,7 +1068,7 @@ impl Writer {
     }
 
     /// Sets BSD flags (e.g. UF_HIDDEN 0x8000), preserving the compression flag.
-    pub fn set_bsd_flags(&mut self, v: usize, ino: u64, flags: u32) -> io::Result<()> {
+    fn do_set_bsd_flags(&mut self, v: usize, ino: u64, flags: u32) -> io::Result<()> {
         self.writable(v)?;
         let mut rec = self.inode_rec(v, ino)?;
         let keep = u32le(&rec.fixed, 68) & UF_COMPRESSED;
@@ -1181,3 +1180,85 @@ fn copy_overlap(buf: &mut [u8], buf_off: u64, data_off: u64, data: &[u8]) {
             .copy_from_slice(&data[(s - data_off) as usize..(e - data_off) as usize]);
     }
 }
+
+/// Public operations. Each runs atomically: if it fails after it started changing things, every
+/// uncommitted change is dropped (as if the program had stopped right after the last commit).
+impl Writer {
+    /// Creates a file, directory or symlink named `name` in directory `parent`. Returns its inode id.
+    pub fn create(&mut self, v: usize, parent: u64, name: &str, kind: Kind, perm: u16) -> io::Result<u64> {
+        self.atomic(SMALL, |w| w.do_create(v, parent, name, kind, perm))
+    }
+
+    /// Writes `data` at byte `off` of regular file `ino`, growing it as needed.
+    pub fn write_at(&mut self, v: usize, ino: u64, off: u64, data: &[u8]) -> io::Result<()> {
+        let blocks = (data.len() as u64).div_ceil(self.c.block_size) + 1;
+        self.atomic(SMALL + blocks, |w| w.do_write_at(v, ino, off, data))
+    }
+
+    /// Sets a regular file's size. Growing adds a hole; shrinking frees the blocks past the end.
+    pub fn set_size(&mut self, v: usize, ino: u64, size: u64) -> io::Result<()> {
+        self.atomic(TINY, |w| w.do_set_size(v, ino, size))
+    }
+
+    /// Removes the entry `name` from `parent`; deletes the inode when its last link goes.
+    pub fn remove(&mut self, v: usize, parent: u64, name: &str) -> io::Result<()> {
+        self.atomic(TINY, |w| w.do_remove(v, parent, name))
+    }
+
+    /// Adds a hard link `new_parent/new_name` to the existing file `ino`.
+    pub fn link(&mut self, v: usize, ino: u64, new_parent: u64, new_name: &str) -> io::Result<()> {
+        self.atomic(SMALL, |w| w.do_link(v, ino, new_parent, new_name))
+    }
+
+    /// APFS clone: a new file sharing `src`'s data blocks until either side is written.
+    pub fn clone_file(&mut self, v: usize, src: u64, parent: u64, name: &str) -> io::Result<u64> {
+        self.atomic(SMALL, |w| w.do_clone_file(v, src, parent, name))
+    }
+
+    /// Moves/renames an entry. An existing target is replaced only if `replace` (directories must be empty).
+    pub fn rename(
+        &mut self,
+        v: usize,
+        parent: u64,
+        name: &str,
+        new_parent: u64,
+        new_name: &str,
+        replace: bool,
+    ) -> io::Result<()> {
+        self.atomic(SMALL, |w| w.do_rename(v, parent, name, new_parent, new_name, replace))
+    }
+
+    /// Turns on size tracking ("directory statistics") for an empty directory, as macOS can.
+    #[doc(hidden)]
+    pub fn enable_dir_stats(&mut self, v: usize, dir: u64) -> io::Result<()> {
+        self.atomic(SMALL, |w| w.do_enable_dir_stats(v, dir))
+    }
+
+    /// Sets timestamps (nanoseconds since 1970); `None` leaves one unchanged.
+    pub fn set_times(
+        &mut self,
+        v: usize,
+        ino: u64,
+        create: Option<u64>,
+        modify: Option<u64>,
+        change: Option<u64>,
+        access: Option<u64>,
+    ) -> io::Result<()> {
+        self.atomic(TINY, |w| w.do_set_times(v, ino, create, modify, change, access))
+    }
+
+    /// Sets the permission bits (the file type bits are kept).
+    pub fn set_mode(&mut self, v: usize, ino: u64, perm: u16) -> io::Result<()> {
+        self.atomic(TINY, |w| w.do_set_mode(v, ino, perm))
+    }
+
+    /// Sets BSD flags (e.g. UF_HIDDEN 0x8000), preserving the compression flag.
+    pub fn set_bsd_flags(&mut self, v: usize, ino: u64, flags: u32) -> io::Result<()> {
+        self.atomic(TINY, |w| w.do_set_bsd_flags(v, ino, flags))
+    }
+}
+
+/// Free blocks an operation needs before it starts: metadata copy-on-write for the operation and the
+/// next commit. Removals need less so a full disk can still be cleaned up.
+const SMALL: u64 = 64;
+const TINY: u64 = 16;

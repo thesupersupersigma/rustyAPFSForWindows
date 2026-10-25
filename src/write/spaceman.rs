@@ -409,6 +409,11 @@ impl Spaceman {
         Ok(out)
     }
 
+    /// Blocks waiting in the main free queue.
+    pub(crate) fn queued_main_blocks(&self) -> u64 {
+        self.fq[SFQ_MAIN].values().sum()
+    }
+
     /// Total queued entries in the main free queue (for deciding when to drain harder).
     pub(crate) fn main_queue_len(&self) -> usize {
         self.fq[SFQ_MAIN].len()

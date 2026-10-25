@@ -16,7 +16,7 @@ use crate::{Volume, bad, u32le, u64le};
 use spaceman::{SFQ_IP, SFQ_MAIN, Spaceman};
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tree::TreeId;
 
 const OBJECT_TYPE_SPACEMAN: u32 = 0x5;
@@ -68,6 +68,13 @@ pub struct Writer {
     pub(crate) nx_omap: OmapState,
     pub(crate) vols: Vec<Vol>,
     dirty: bool,
+    /// Where we came from, to reload on rollback.
+    path: PathBuf,
+    partition: Option<usize>,
+    /// Bumped by every in-memory state change; tells whether a failed operation changed anything.
+    mutations: u64,
+    /// Set when a rollback itself failed (e.g. the disk went away): everything is refused afterwards.
+    poisoned: Option<String>,
 }
 
 /// Computes and stores an object's Fletcher-64 checksum.
@@ -172,7 +179,22 @@ impl Writer {
             });
         }
         let txn = u64le(&nx, 96);
-        let mut w = Writer { c, txn, nx, sm, sm_oid, fq_roots, eph, nx_omap, vols, dirty: false };
+        let mut w = Writer {
+            c,
+            txn,
+            nx,
+            sm,
+            sm_oid,
+            fq_roots,
+            eph,
+            nx_omap,
+            vols,
+            dirty: false,
+            path: path.as_ref().to_path_buf(),
+            partition,
+            mutations: 0,
+            poisoned: None,
+        };
         w.sm.drain(&w.c, txn.saturating_sub(2), txn)?;
         Ok(w)
     }
@@ -212,6 +234,7 @@ impl Writer {
     }
 
     pub(crate) fn alloc(&mut self, owner: Option<usize>, want: u64) -> io::Result<(u64, u64)> {
+        self.mutations += 1;
         let (start, n) = self.sm.alloc(&self.c, want, self.txn)?;
         self.dirty = true;
         if let Some(v) = owner {
@@ -226,6 +249,7 @@ impl Writer {
     }
 
     pub(crate) fn free(&mut self, owner: Option<usize>, paddr: u64, n: u64) -> io::Result<()> {
+        self.mutations += 1;
         self.sm.free(paddr, n, self.txn);
         self.dirty = true;
         if let Some(v) = owner {
@@ -236,6 +260,7 @@ impl Writer {
     }
 
     pub(crate) fn vol_add(&mut self, v: usize, off: usize, delta: i64) {
+        self.mutations += 1;
         let sb = &mut self.vols[v].sb;
         let x = (u64le(sb, off) as i64 + delta) as u64;
         sb[off..off + 8].copy_from_slice(&x.to_le_bytes());
@@ -245,6 +270,7 @@ impl Writer {
 
     /// Next container-wide virtual object id.
     pub(crate) fn next_oid(&mut self) -> u64 {
+        self.mutations += 1;
         let oid = u64le(&self.nx, 88);
         self.nx[88..96].copy_from_slice(&(oid + 1).to_le_bytes());
         oid
@@ -302,8 +328,49 @@ impl Writer {
         Ok(addr)
     }
 
-    /// Makes all changes durable by writing a new checkpoint.
+    /// Makes all changes durable by writing a new checkpoint. If that fails, the uncommitted changes
+    /// are dropped and the volume stays as of the previous commit.
     pub fn commit(&mut self) -> io::Result<()> {
+        self.atomic(0, |w| w.do_commit())
+    }
+
+    /// Runs `f`; if it fails after changing state, rolls back to the last commit. Refuses to start when
+    /// fewer than `need` blocks are free (so a full disk fails cleanly instead of half-way).
+    pub(crate) fn atomic<T>(&mut self, need: u64, f: impl FnOnce(&mut Self) -> io::Result<T>) -> io::Result<T> {
+        if let Some(why) = &self.poisoned {
+            return Err(io::Error::other(format!("writer unusable after a failed rollback: {why}")));
+        }
+        // Freed blocks only return two commits later; when short of space, commit to reclaim them.
+        for _ in 0..2 {
+            if self.sm.free_blocks() >= need || self.sm.queued_main_blocks() == 0 {
+                break;
+            }
+            self.dirty = true;
+            if let Err(e) = self.do_commit() {
+                self.rollback();
+                return Err(e);
+            }
+        }
+        if self.sm.free_blocks() < need {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "APFS container is full"));
+        }
+        let before = self.mutations;
+        let r = f(self);
+        if r.is_err() && self.mutations != before {
+            self.rollback();
+        }
+        r
+    }
+
+    /// Drops every uncommitted change by reloading from disk, exactly like reopening after a crash.
+    fn rollback(&mut self) {
+        match Writer::open(&self.path, self.partition) {
+            Ok(fresh) => *self = fresh,
+            Err(e) => self.poisoned = Some(e.to_string()),
+        }
+    }
+
+    fn do_commit(&mut self) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
         }

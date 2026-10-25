@@ -372,3 +372,39 @@ fn directory_statistics_stay_correct() {
     drop(w);
     fsck(&p);
 }
+
+#[test]
+fn full_disk_fails_cleanly_and_recovers() {
+    let p = fresh("full", 24, &["-L", "Full"]);
+    let mut w = Writer::open(&p, None).unwrap();
+    let keep = w.create(0, 2, "keep.txt", Kind::File, 0o644).unwrap();
+    w.write_at(0, keep, 0, b"must survive").unwrap();
+    w.commit().unwrap();
+    let f = w.create(0, 2, "filler.bin", Kind::File, 0o644).unwrap();
+    let chunk = pattern(1 << 20, 3);
+    let mut written = 0u64;
+    let err = loop {
+        match w.write_at(0, f, written, &chunk) {
+            Ok(()) => written += chunk.len() as u64,
+            Err(e) => break e,
+        }
+        assert!(written < 64 << 20, "never filled up");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::StorageFull, "{err}");
+    w.commit().unwrap();
+    drop(w);
+    fsck(&p);
+    assert_eq!(read(&p, "keep.txt"), b"must survive");
+    assert_eq!(read(&p, "filler.bin").len() as u64, written);
+    // Deleting frees the space again (after the free queue drains over two commits).
+    let mut w = Writer::open(&p, None).unwrap();
+    w.remove(0, 2, "filler.bin").unwrap();
+    w.commit().unwrap();
+    w.commit().unwrap();
+    let g = w.create(0, 2, "again.bin", Kind::File, 0o644).unwrap();
+    w.write_at(0, g, 0, &chunk).unwrap();
+    w.commit().unwrap();
+    drop(w);
+    fsck(&p);
+    assert_eq!(read(&p, "again.bin"), chunk);
+}

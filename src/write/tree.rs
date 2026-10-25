@@ -332,6 +332,7 @@ impl Writer {
 
     /// Writes a node copy-on-write and returns the pointer its parent should hold.
     fn store(&mut self, t: TreeId, def: &Def, node: &mut Node) -> io::Result<u64> {
+        self.mutations += 1;
         let owner = self.owner(t);
         if node.xid != self.txn || node.addr == 0 {
             let new = self.alloc_meta(owner)?;
