@@ -1,6 +1,9 @@
 ignored/
 APFS-for-Windows/
 tools/kawaiidra-mcp/
+tools/apfsprogs/
+tools/apfsprogs-build/
+tools/bin/
 ghidra/
 
 
