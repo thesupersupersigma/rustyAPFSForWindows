@@ -886,9 +886,20 @@ fn start(m: Mount) -> io::Result<FileSystemHost<ApfsFs>> {
     Ok(host)
 }
 
-/// Mounts every volume in `mounts` and serves them until Ctrl+C, committing each writer about once a
-/// second while it has changes and once more on the way out.
-pub fn serve(mounts: Vec<Mount>) -> io::Result<()> {
+/// Mounted volumes being served. A background thread commits each writer about once a second while
+/// it has changes; `stop` unmounts and commits once more.
+pub struct Session {
+    hosts: Vec<FileSystemHost<ApfsFs>>,
+    writers: Vec<Arc<Mutex<Writer>>>,
+    stop: Arc<AtomicBool>,
+    committer: Option<std::thread::JoinHandle<()>>,
+    /// Where each started volume is mounted, in start order.
+    pub mountpoints: Vec<String>,
+}
+
+/// Mounts every volume in `mounts`. Volumes that fail to mount are reported on stderr; fails only if
+/// none could be mounted.
+pub fn start_session(mounts: Vec<Mount>) -> io::Result<Session> {
     preload_winfsp();
     winfsp::winfsp_init().map_err(|e| io::Error::other(format!("WinFsp is not installed or failed to load: {e:?}")))?;
     let mut writers: Vec<Arc<Mutex<Writer>>> = vec![];
@@ -899,47 +910,76 @@ pub fn serve(mounts: Vec<Mount>) -> io::Result<()> {
             writers.push(w.clone());
         }
     }
-    let mut hosts = vec![];
+    let (mut hosts, mut mountpoints, mut first_err) = (vec![], vec![], None);
     for m in mounts {
         let mp = m.mountpoint.clone();
         match start(m) {
-            Ok(h) => hosts.push(h),
-            Err(e) => eprintln!("{mp}: {e}"),
-        }
-    }
-    if hosts.is_empty() {
-        return Err(io::Error::other("nothing could be mounted"));
-    }
-    // SAFETY: registers a plain function; it only touches an atomic.
-    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
-    println!("press Ctrl+C to unmount");
-    let mut ticks = 0;
-    while !STOP.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        ticks += 1;
-        if ticks % 5 == 0 {
-            for w in &writers {
-                if let Ok(mut w) = lock(w)
-                    && w.has_changes()
-                    && let Err(e) = w.commit()
-                {
-                    eprintln!("commit failed: {e}");
-                }
+            Ok(h) => {
+                hosts.push(h);
+                mountpoints.push(mp);
+            }
+            Err(e) => {
+                eprintln!("{mp}: {e}");
+                first_err.get_or_insert(e);
             }
         }
     }
-    for mut h in hosts {
-        h.stop();
-        h.unmount();
+    if hosts.is_empty() {
+        return Err(first_err.unwrap_or_else(|| io::Error::other("nothing to mount")));
     }
-    let mut result = Ok(());
-    for w in &writers {
-        if let Err(e) = lock(w).and_then(|mut w| w.commit()) {
-            result = Err(e);
+    let stop = Arc::new(AtomicBool::new(false));
+    let committer = {
+        let (stop, writers) = (stop.clone(), writers.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                for w in &writers {
+                    if let Ok(mut w) = lock(w)
+                        && w.has_changes()
+                        && let Err(e) = w.commit()
+                    {
+                        eprintln!("commit failed: {e}");
+                    }
+                }
+            }
+        })
+    };
+    Ok(Session { hosts, writers, stop, committer: Some(committer), mountpoints })
+}
+
+impl Session {
+    /// Unmounts everything and commits the last changes.
+    pub fn stop(mut self) -> io::Result<()> {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.committer.take() {
+            let _ = t.join();
         }
+        for h in &mut self.hosts {
+            h.stop();
+            h.unmount();
+        }
+        let mut result = Ok(());
+        for w in &self.writers {
+            if let Err(e) = lock(w).and_then(|mut w| w.commit()) {
+                result = Err(e);
+            }
+        }
+        result
     }
+}
+
+/// Mounts every volume in `mounts` and serves them until Ctrl+C.
+pub fn serve(mounts: Vec<Mount>) -> io::Result<()> {
+    let session = start_session(mounts)?;
+    // SAFETY: registers a plain function; it only touches an atomic.
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
+    println!("press Ctrl+C to unmount");
+    while !STOP.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let r = session.stop();
     println!("unmounted");
-    result
+    r
 }
 
 /// Prepares `vol` for a read-only mount at `mountpoint` (a drive like `X:` or a new folder path).

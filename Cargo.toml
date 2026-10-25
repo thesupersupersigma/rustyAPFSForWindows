@@ -3,7 +3,7 @@ name = "rusty-apfs"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "APFS reader (and, later, writer) for Windows"
+description = "Read and write Mac (APFS) drives on Windows"
 
 [lib]
 name = "rusty_apfs"
@@ -11,6 +11,11 @@ name = "rusty_apfs"
 [[bin]]
 name = "apfs"
 path = "src/main.rs"
+
+[[bin]]
+name = "apfs-gui"
+path = "src/bin/apfs-gui.rs"
+required-features = ["gui"]
 
 [dependencies]
 aes = "0.9.3"
@@ -25,7 +30,13 @@ unicode-normalization = "0.1.26"
 xts-mode = "0.6.0"
 
 [target."cfg(windows)".dependencies]
+eframe = { version = "0.36.2", optional = true, default-features = false, features = ["glow", "default_fonts"] }
+rfd = { version = "0.17.2", optional = true }
 winfsp = "0.13.2"
 
 [target."cfg(windows)".build-dependencies]
 winfsp = "0.13.2"
+
+[features]
+# The desktop app (apfs-gui): cargo build --release --features gui
+gui = ["dep:eframe", "dep:rfd"]
