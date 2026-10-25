@@ -219,3 +219,21 @@ fn writes_to_an_apple_made_volume() {
     fsck(&p);
     std::fs::remove_file(&p).unwrap();
 }
+
+/// Containers over ~3 TB keep chunk-info addresses in CABs. Needs a big sparse image made by hand:
+/// set RUSTY_APFS_BIG_IMAGE to an mkapfs-formatted sparse file (e.g. 4 TiB).
+#[test]
+#[ignore]
+fn big_container_with_cabs() {
+    let p = PathBuf::from(std::env::var("RUSTY_APFS_BIG_IMAGE").expect("set RUSTY_APFS_BIG_IMAGE"));
+    let mut w = Writer::open(&p, None).unwrap();
+    let f = w.create(0, 2, "big.bin", Kind::File, 0o644).unwrap();
+    let data = pattern(5 << 20, 4);
+    w.write_at(0, f, 0, &data).unwrap();
+    w.commit().unwrap();
+    w.set_size(0, f, 1 << 20).unwrap();
+    w.commit().unwrap();
+    drop(w);
+    assert_eq!(read(&p, "big.bin"), &data[..1 << 20]);
+    fsck(&p);
+}

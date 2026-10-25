@@ -485,7 +485,7 @@ impl Writer {
         let end = off + data.len() as u64;
         let mut exts = old.clone();
         if end > size {
-            self.zero_tail(&exts, size)?;
+            self.zero_tail(v, &mut exts, size)?;
         }
         // Cover the write range with extents, then give holes inside it real blocks.
         let (b0, b1) = (off / bs * bs, end.div_ceil(bs) * bs);
@@ -532,18 +532,26 @@ impl Writer {
     }
 
     /// Zeroes the bytes after `size` in its last block, so growing the file never exposes stale data.
-    fn zero_tail(&mut self, exts: &[Ext], size: u64) -> io::Result<()> {
+    /// The block is copied rather than zeroed in place: until commit, the old block may still hold
+    /// committed bytes (after an uncommitted shrink).
+    fn zero_tail(&mut self, v: usize, exts: &mut Vec<Ext>, size: u64) -> io::Result<()> {
         let bs = self.c.block_size;
         if size.is_multiple_of(bs) {
             return Ok(());
         }
-        if let Some(e) = exts.iter().find(|e| e.phys != 0 && e.logical <= size && size < e.logical + e.len) {
-            let blk = e.phys * bs + (size / bs * bs - e.logical);
-            let mut buf = vec![0u8; bs as usize];
-            self.c.dev.read_at(blk, &mut buf)?;
-            buf[(size % bs) as usize..].fill(0);
-            self.c.dev.write_at(blk, &buf)?;
+        let blk = size / bs * bs;
+        if !exts.iter().any(|e| e.phys != 0 && e.logical <= blk && blk < e.logical + e.len) {
+            return Ok(());
         }
+        split_at(exts, blk, bs);
+        split_at(exts, blk + bs, bs);
+        let e = exts.iter_mut().find(|e| e.logical == blk).expect("split made this extent");
+        let mut buf = vec![0u8; bs as usize];
+        self.c.dev.read_at(e.phys * bs, &mut buf)?;
+        buf[(size % bs) as usize..].fill(0);
+        let (new, _) = self.alloc(Some(v), 1)?;
+        self.c.dev.write_at(new * bs, &buf)?;
+        exts.iter_mut().find(|e| e.logical == blk).unwrap().phys = new;
         Ok(())
     }
 
@@ -558,15 +566,15 @@ impl Writer {
         let mut exts = old.clone();
         let want = new_size.div_ceil(bs) * bs;
         if new_size > size {
-            self.zero_tail(&exts, size)?;
+            self.zero_tail(v, &mut exts, size)?;
             let alloced = exts.last().map_or(0, |e| e.logical + e.len);
             if want > alloced {
                 exts.push(Ext { logical: alloced, len: want - alloced, phys: 0 });
             }
         } else {
+            // Bytes past the new end stay until the file grows again; growing zeroes them (zero_tail).
             split_at(&mut exts, want, bs);
             exts.retain(|e| e.logical < want);
-            self.zero_tail(&exts, new_size)?;
         }
         self.finish_data(v, ino, rec, &old, exts, new_size)
     }

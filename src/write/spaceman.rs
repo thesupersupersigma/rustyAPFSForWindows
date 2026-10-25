@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 
 const OBJECT_TYPE_SPACEMAN_CIB: u32 = 0x7;
-const OBJECT_TYPE_SPACEMAN_CAB: u32 = 0x8;
+const OBJECT_TYPE_SPACEMAN_CAB: u32 = 0x6;
 const CI_COUNT_MASK: u32 = 0x000f_ffff;
 const IP_BM_INDEX_INVALID: u16 = 0xffff;
 pub(crate) const SFQ_IP: usize = 0;

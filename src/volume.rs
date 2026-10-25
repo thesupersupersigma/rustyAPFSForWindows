@@ -533,3 +533,33 @@ pub(crate) fn names_match(case_insensitive: bool, stored: &str, wanted: &str) ->
 fn not_found(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("not found: {what}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::Container;
+
+    /// Our name hash must reproduce Apple's for every directory entry in the Apple-made test images.
+    #[test]
+    fn name_hashes_match_apple() {
+        for image in ["case_insensitive", "case_sensitive", "jhfs_converted"] {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("ignored/testdata/{image}.bin"));
+            let c = Container::open(&p).unwrap();
+            let v = c.volumes().unwrap().remove(0);
+            let mut checked = 0;
+            v.scan(&|_| std::cmp::Ordering::Equal, &mut |k, _| {
+                if super::u64le(k, 0) >> 60 == 9 {
+                    let name = super::cstr(&k[12..]);
+                    assert_eq!(
+                        crate::write::name_hash(v.case_insensitive(), &name),
+                        super::u32le(k, 8) >> 10,
+                        "{image}: {name:?}"
+                    );
+                    checked += 1;
+                }
+                Ok(true)
+            })
+            .unwrap();
+            assert!(checked > 20, "{image}: only {checked} entries");
+        }
+    }
+}
