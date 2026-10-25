@@ -1,0 +1,9 @@
+ignored/
+APFS-for-Windows/
+tools/kawaiidra-mcp/
+ghidra/
+
+
+# Added by cargo
+
+/target

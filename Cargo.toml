@@ -1,0 +1,21 @@
+[package]
+name = "rusty-apfs"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "APFS reader (and, later, writer) for Windows"
+
+[lib]
+name = "rusty_apfs"
+
+[[bin]]
+name = "apfs"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.1.10"
+lzfse_rust = "0.2.1"
+unicode-normalization = "0.1.26"
+
+[dev-dependencies]
+sha2 = "0.11.1"

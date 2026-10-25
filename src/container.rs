@@ -1,0 +1,168 @@
+use crate::{Volume, bad, btree, u32le, u64le};
+use std::fs;
+use std::io;
+use std::path::Path;
+
+pub(crate) const OBJ_PHYSICAL: u32 = 0x4000_0000;
+pub(crate) const OBJECT_TYPE_NX_SUPERBLOCK: u32 = 0x1;
+pub(crate) const OBJECT_TYPE_BTREE: u32 = 0x2;
+pub(crate) const OBJECT_TYPE_BTREE_NODE: u32 = 0x3;
+pub(crate) const OBJECT_TYPE_OMAP: u32 = 0xb;
+pub(crate) const OBJECT_TYPE_FS: u32 = 0xd;
+const NX_MAGIC: &[u8; 4] = b"NXSB";
+
+/// An APFS container: the whole partition or image, holding one or more volumes.
+pub struct Container {
+    file: fs::File,
+    pub block_size: u64,
+    /// Transaction id of the checkpoint we mounted.
+    pub xid: u64,
+    /// The checkpoint's container superblock.
+    pub superblock: Vec<u8>,
+    /// Newer checkpoints we rejected, newest first, with the reason.
+    pub skipped: Vec<String>,
+    omap_tree: u64,
+}
+
+impl Container {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Container> {
+        let file = fs::File::open(path)?;
+        let mut c = Container { file, block_size: 4096, xid: 0, superblock: vec![], skipped: vec![], omap_tree: 0 };
+
+        let b0 = c.read_block(0)?;
+        if &b0[32..36] != NX_MAGIC {
+            return Err(bad("not an APFS container (no NXSB magic in block 0)"));
+        }
+        c.block_size = u32le(&b0, 36) as u64;
+        if !c.block_size.is_power_of_two() || !(4096..=65536).contains(&c.block_size) {
+            return Err(bad(format!("unsupported block size {}", c.block_size)));
+        }
+        let b0 = c.read_block(0)?;
+
+        // The newest valid superblock in the checkpoint descriptor area wins (spec: "Mounting a Container").
+        let desc_blocks = u32le(&b0, 104);
+        let desc_base = u64le(&b0, 112);
+        let mut candidates = vec![];
+        if desc_blocks & 0x8000_0000 != 0 {
+            // shortcut: descriptor area stored as a B-tree isn't handled, fall back to block 0's copy.
+            candidates.push(b0);
+        } else {
+            for i in 0..desc_blocks as u64 {
+                let b = c.read_block(desc_base + i)?;
+                if &b[32..36] == NX_MAGIC && u32le(&b, 24) & 0xffff == OBJECT_TYPE_NX_SUPERBLOCK {
+                    candidates.push(b);
+                }
+            }
+        }
+        candidates.sort_by_key(|b| std::cmp::Reverse(u64le(b, 16)));
+
+        for sb in candidates {
+            let xid = u64le(&sb, 16);
+            if !checksum_ok(&sb) {
+                c.skipped.push(format!("Skipping superblock xid={xid}: Invalid nx_superblock checksum"));
+                continue;
+            }
+            match c.omap_tree_of(u64le(&sb, 160)) {
+                Ok(tree) => {
+                    c.xid = xid;
+                    c.omap_tree = tree;
+                    c.superblock = sb;
+                    return Ok(c);
+                }
+                Err(e) => c.skipped.push(format!("Skipping superblock xid={xid}: invalid OMAP ({e})")),
+            }
+        }
+        Err(bad(format!("no valid checkpoint found: {:?}", c.skipped)))
+    }
+
+    pub fn read_block(&self, paddr: u64) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0; self.block_size as usize];
+        self.read_at(paddr * self.block_size, &mut buf)?;
+        Ok(buf)
+    }
+
+    pub(crate) fn read_at(&self, mut off: u64, mut buf: &mut [u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            #[cfg(windows)]
+            let n = std::os::windows::fs::FileExt::seek_read(&self.file, buf, off)?;
+            #[cfg(unix)]
+            let n = std::os::unix::fs::FileExt::read_at(&self.file, buf, off)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("read past end at byte {off}")));
+            }
+            off += n as u64;
+            buf = &mut buf[n..];
+        }
+        Ok(())
+    }
+
+    /// Reads a physical object and checks its checksum and type.
+    pub(crate) fn read_obj(&self, paddr: u64, want_type: u32) -> io::Result<Vec<u8>> {
+        let b = self.read_block(paddr)?;
+        if !checksum_ok(&b) {
+            return Err(bad(format!("bad checksum on object at block {paddr}")));
+        }
+        let ty = u32le(&b, 24) & 0xffff;
+        if ty != want_type {
+            return Err(bad(format!("object at block {paddr} has type {ty:#x}, expected {want_type:#x}")));
+        }
+        Ok(b)
+    }
+
+    /// Returns the physical address of an object map's B-tree root.
+    pub(crate) fn omap_tree_of(&self, omap_paddr: u64) -> io::Result<u64> {
+        let omap = self.read_obj(omap_paddr, OBJECT_TYPE_OMAP)?;
+        let tree = u64le(&omap, 48);
+        self.read_obj(tree, OBJECT_TYPE_BTREE)?;
+        Ok(tree)
+    }
+
+    /// Resolves a virtual object id to a physical block: the newest mapping with xid <= `xid`.
+    pub(crate) fn omap_lookup(&self, omap_tree: u64, oid: u64, xid: u64) -> io::Result<u64> {
+        let mut found = None;
+        btree::walk(
+            self,
+            omap_tree,
+            &|child| Ok(child), // omap trees are physical
+            &|k| u64le(k, 0).cmp(&oid),
+            &mut |k, v| {
+                if u64le(k, 8) <= xid {
+                    found = Some(u64le(v, 8));
+                }
+                Ok(true)
+            },
+        )?;
+        found
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("oid {oid} not in object map at xid {xid}")))
+    }
+
+    pub fn volumes(&self) -> io::Result<Vec<Volume<'_>>> {
+        let max = u32le(&self.superblock, 180).min(100) as usize;
+        let mut out = vec![];
+        for i in 0..max {
+            let oid = u64le(&self.superblock, 184 + 8 * i);
+            if oid != 0 {
+                let paddr = self.omap_lookup(self.omap_tree, oid, self.xid)?;
+                out.push(Volume::new(self, self.read_obj(paddr, OBJECT_TYPE_FS)?, self.xid)?);
+            }
+        }
+        Ok(out)
+    }
+}
+
+pub(crate) fn checksum_ok(block: &[u8]) -> bool {
+    fletcher64(&block[8..]) == u64le(block, 0)
+}
+
+/// Fletcher-64 as defined in the spec ("Checksum").
+pub(crate) fn fletcher64(data: &[u8]) -> u64 {
+    const M: u64 = 0xffff_ffff;
+    let (mut s1, mut s2) = (0u64, 0u64);
+    for w in data.chunks_exact(4) {
+        s1 = (s1 + u32::from_le_bytes(w.try_into().unwrap()) as u64) % M;
+        s2 = (s2 + s1) % M;
+    }
+    let c1 = M - ((s1 + s2) % M);
+    let c2 = M - ((s1 + c1) % M);
+    (c2 << 32) | c1
+}
