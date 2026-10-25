@@ -6,7 +6,8 @@ const USAGE: &str = "usage: apfs list                      (APFS partitions on p
        apfs <image|disk> info [--partition N] [--password PW]
        apfs <image|disk> ls  [path] [--volume N] [--snapshot NAME] [--password PW]
        apfs <image|disk> cat <path> [--volume N] [--snapshot NAME] [--password PW]
-       apfs <image|disk> mount <X: | new-folder> [--volume N] [--snapshot NAME] [--password PW]";
+       apfs <image|disk> mount <X: | new-folder> [--volume N] [--snapshot NAME] [--password PW] [--read-only]
+                      (read-write unless --read-only, a snapshot, or a volume we can't write)";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -31,7 +32,21 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
         return list();
     }
     let password = opt(&mut args, "--password");
+    let read_only = args.iter().position(|a| a == "--read-only").map(|i| args.remove(i)).is_some();
     let [image, cmd, rest @ ..] = args.as_slice() else { return Err(usage()) };
+
+    #[cfg(windows)]
+    if cmd == "mount" && !read_only && snap.is_none() {
+        let mountpoint = rest.first().ok_or_else(usage)?;
+        match rusty_apfs::write::Writer::open(image, partition) {
+            Ok(w) if vol_idx >= w.volume_count() => return Err(io::Error::other(format!("no volume {vol_idx}"))),
+            Ok(w) => match w.read_only_reason(vol_idx) {
+                None => return rusty_apfs::mount::mount_rw(w, vol_idx, mountpoint),
+                Some(why) => eprintln!("mounting read-only: {why}"),
+            },
+            Err(e) => eprintln!("mounting read-only: {e}"),
+        }
+    }
 
     let c = match partition {
         Some(n) => Container::open_partition(image, n)?,

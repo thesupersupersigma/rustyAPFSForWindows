@@ -253,6 +253,11 @@ impl<'c> Volume<'c> {
 
     /// Finds `name` in directory `dir` (case/normalization rules of the volume), returning its inode id.
     pub fn find_child(&self, dir: u64, name: &str) -> io::Result<Option<u64>> {
+        Ok(self.find_child_named(dir, name)?.map(|(id, _)| id))
+    }
+
+    /// Like `find_child`, but also returns the name as stored on disk (its case and normalization).
+    pub fn find_child_named(&self, dir: u64, name: &str) -> io::Result<Option<(u64, String)>> {
         let ci = self.case_insensitive();
         // Hashed volumes: only records with the name's hash can match. ASCII folding is unambiguous;
         // for other names also fall back to a scan in case Apple's case folding differs from ours.
@@ -260,8 +265,9 @@ impl<'c> Volume<'c> {
             let hash = crate::write::name_hash(ci, name);
             let mut found = None;
             self.scan(&|k: &[u8]| drec_hash_cmp(k, dir, hash), &mut |k, v| {
-                if names_match(ci, &cstr(&k[12..]), name) {
-                    found = Some(u64le(slice(v, 0, 8)?, 0));
+                let stored = cstr(&k[12..]);
+                if names_match(ci, &stored, name) {
+                    found = Some((u64le(slice(v, 0, 8)?, 0), stored));
                     return Ok(false);
                 }
                 Ok(true)
@@ -270,7 +276,7 @@ impl<'c> Volume<'c> {
                 return Ok(found);
             }
         }
-        Ok(self.read_dir(dir)?.into_iter().find(|e| names_match(ci, &e.name, name)).map(|e| e.id))
+        Ok(self.read_dir(dir)?.into_iter().find(|e| names_match(ci, &e.name, name)).map(|e| (e.id, e.name)))
     }
 
     /// Visits file-system tree records in key order whose key `cmp` reports `Equal`.
