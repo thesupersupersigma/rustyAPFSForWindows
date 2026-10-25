@@ -1316,7 +1316,9 @@ impl Writer {
     /// commit in between, and makes room in the free queue: one commit may only queue as many freed
     /// ranges as the free queue can describe (Apple deletes big files incrementally too).
     fn free_gradually(&mut self, v: usize, ino: u64, size: u64) -> io::Result<()> {
-        let budget = (self.sm.main_queue_limit() / 3).max(1);
+        // Each freed range may touch its own chunk, whose bitmap and chunk-info copies go to the
+        // internal-pool queue, so that queue bounds a step too.
+        let budget = (self.sm.main_queue_limit() / 3).min(self.sm.ip_queue_limit() / 6).max(1);
         loop {
             let rec = self.inode_rec(v, ino)?;
             let private = rec.u64(8);

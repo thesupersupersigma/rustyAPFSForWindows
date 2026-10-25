@@ -420,7 +420,16 @@ impl Spaceman {
     }
 
     pub(crate) fn main_queue_limit(&self) -> usize {
-        let limit = u16le(&self.raw, 200 + 40 * SFQ_MAIN + 24) as usize;
+        self.queue_limit(SFQ_MAIN)
+    }
+
+    /// Records the internal-pool free queue can hold; each chunk touched in a commit adds up to two.
+    pub(crate) fn ip_queue_limit(&self) -> usize {
+        self.queue_limit(SFQ_IP)
+    }
+
+    fn queue_limit(&self, q: usize) -> usize {
+        let limit = u16le(&self.raw, 200 + 40 * q + 24) as usize;
         let per_leaf = (self.bs as usize - 56 - tree::INFO) / (16 + 8 + 4);
         // A two-level tree: the root indexes at most `per_leaf` leaves.
         if limit <= 1 { per_leaf } else { (limit - 1).min(per_leaf) * per_leaf }
