@@ -22,7 +22,7 @@ Built from Apple's public [Apple File System Reference](https://developer.apple.
 ## Try it
 
 Building needs `libclang` for the WinFsp bindings. Visual Studio ships it; point `LIBCLANG_PATH` at it, e.g.
-`C:\Program Files\Microsoft Visual Studio8\Community\VC\Tools\Llvmdin`.
+`C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin`.
 
 ```
 cargo build --release
