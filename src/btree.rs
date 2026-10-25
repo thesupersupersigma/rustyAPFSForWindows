@@ -1,6 +1,7 @@
 //! Generic APFS B-tree traversal (spec: "B-Trees").
 
 use crate::container::{Container, OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE};
+use crate::crypto::Xts;
 use crate::{bad, slice, u16le, u32le, u64le};
 use std::cmp::Ordering;
 use std::io;
@@ -26,17 +27,30 @@ pub(crate) fn walk(
     cmp: &dyn Fn(&[u8]) -> Ordering,
     visit: Visit,
 ) -> io::Result<()> {
-    let data = c.read_obj(root, OBJECT_TYPE_BTREE)?;
+    walk_key(c, root, resolve, cmp, visit, None)
+}
+
+/// `walk` for trees whose nodes may be encrypted with `key` (an unlocked volume's trees).
+pub(crate) fn walk_key(
+    c: &Container,
+    root: u64,
+    resolve: Resolve,
+    cmp: &dyn Fn(&[u8]) -> Ordering,
+    visit: Visit,
+    key: Option<&Xts>,
+) -> io::Result<()> {
+    let data = c.read_obj_key(root, OBJECT_TYPE_BTREE, key)?;
     let fixed = if u16le(&data, 32) & BTNODE_FIXED_KV_SIZE != 0 {
         let info = data.len() - INFO_SIZE;
         Some((u32le(&data, info + 8) as usize, u32le(&data, info + 12) as usize))
     } else {
         None
     };
-    walk_node(c, &data, fixed, resolve, cmp, visit, 0)?;
+    walk_node(c, &data, fixed, resolve, cmp, visit, key, 0)?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // recursion state; bundling it into a struct would only move the noise
 fn walk_node(
     c: &Container,
     data: &[u8],
@@ -44,6 +58,7 @@ fn walk_node(
     resolve: Resolve,
     cmp: &dyn Fn(&[u8]) -> Ordering,
     visit: Visit,
+    key: Option<&Xts>,
     depth: u32,
 ) -> io::Result<bool> {
     if depth > 16 {
@@ -101,8 +116,8 @@ fn walk_node(
         if i > start && cmp(k) == Ordering::Greater {
             return Ok(false);
         }
-        let child = c.read_obj(resolve(u64le(slice(v, 0, 8)?, 0))?, OBJECT_TYPE_BTREE_NODE)?;
-        if !walk_node(c, &child, fixed, resolve, cmp, visit, depth + 1)? {
+        let child = c.read_obj_key(resolve(u64le(slice(v, 0, 8)?, 0))?, OBJECT_TYPE_BTREE_NODE, key)?;
+        if !walk_node(c, &child, fixed, resolve, cmp, visit, key, depth + 1)? {
             return Ok(false);
         }
     }

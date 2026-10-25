@@ -162,11 +162,30 @@ fn jhfs_converted() {
 }
 
 #[test]
-fn encrypted_volumes_are_refused_cleanly() {
+fn encrypted() {
     let c = image("encrypted");
-    let v = single_volume(&c, "Encrypted", 0x5);
-    assert!(v.encrypted);
-    assert_eq!(v.root().unwrap_err().kind(), ErrorKind::Unsupported);
+    let mut v = single_volume(&c, "Encrypted", 0x5);
+    assert!(v.encrypted && v.is_locked());
+    assert_eq!(v.root().unwrap_err().kind(), ErrorKind::PermissionDenied);
+    v.unlock("password").unwrap();
+    check_content(&v, false);
+}
+
+#[test]
+fn jhfs_encrypted() {
+    // Converted from CoreStorage: 128-bit KEK and VEK.
+    let c = image("jhfs_encrypted");
+    let mut v = single_volume(&c, "JHFS+ Encrypted Converted", 0x1);
+    v.unlock("password").unwrap();
+    check_content(&v, false);
+}
+
+#[test]
+fn wrong_password_is_refused() {
+    let c = image("encrypted");
+    let mut v = single_volume(&c, "Encrypted", 0x5);
+    assert_eq!(v.unlock("hunter2").unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert!(v.is_locked());
 }
 
 #[test]
