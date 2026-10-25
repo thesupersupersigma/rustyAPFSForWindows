@@ -80,6 +80,11 @@ impl Device {
         Ok(())
     }
 
+    /// A second handle to the same device (and the same sharing lock), for reopening in place.
+    pub(crate) fn try_clone(&self) -> io::Result<Device> {
+        Ok(Device { file: self.file.try_clone()?, base: self.base })
+    }
+
     /// Writes whole aligned blocks (all writers in this crate write full blocks).
     pub(crate) fn write_at(&self, off: u64, buf: &[u8]) -> io::Result<()> {
         if !off.is_multiple_of(ALIGN) || !(buf.len() as u64).is_multiple_of(ALIGN) {

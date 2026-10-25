@@ -30,6 +30,7 @@ const APFS_FS_ONEKEY: u64 = 0x8;
 const OMAP_VAL_ENCRYPTED: u32 = 0x4;
 const INCOMPAT_CASE_INSENSITIVE: u64 = 0x1;
 const INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x8;
+const INCOMPAT_ENC_ROLLED: u64 = 0x4;
 const INCOMPAT_SEALED_VOLUME: u64 = 0x20;
 const INCOMPAT_INCOMPLETE_RESTORE: u64 = 0x10;
 const MODIFIED_BY: &str = concat!("rusty-apfs ", env!("CARGO_PKG_VERSION"));
@@ -99,7 +100,10 @@ fn unsupported(msg: impl Into<String>) -> io::Error {
 impl Writer {
     /// Opens an image, partition or GPT disk (see `Container::open`) for writing.
     pub fn open(path: impl AsRef<Path>, partition: Option<usize>) -> io::Result<Writer> {
-        let c = Container::open_rw(path.as_ref(), partition)?;
+        Self::from_container(Container::open_rw(path.as_ref(), partition)?, path.as_ref(), partition)
+    }
+
+    fn from_container(c: Container, path: &Path, partition: Option<usize>) -> io::Result<Writer> {
         let nx = c.superblock.clone();
         let bs = c.block_size;
         if u64le(&nx, 64) & !NX_INCOMPAT_VERSION2 != 0 {
@@ -170,6 +174,10 @@ impl Writer {
                 Some("volumes with snapshots are read-only")
             } else if incompat & (INCOMPAT_SEALED_VOLUME | INCOMPAT_INCOMPLETE_RESTORE) != 0 || u64le(&sb, 1024) != 0 {
                 Some("sealed or partially restored volumes are read-only")
+            } else if incompat & !(INCOMPAT_CASE_INSENSITIVE | INCOMPAT_ENC_ROLLED | INCOMPAT_NORMALIZATION_INSENSITIVE)
+                != 0
+            {
+                Some("the volume uses features this writer doesn't know")
             } else if incompat & (INCOMPAT_CASE_INSENSITIVE | INCOMPAT_NORMALIZATION_INSENSITIVE) == 0 {
                 Some("pre-release (beta) format volumes are read-only")
             } else if u32le(&sb, 116) & OBJ_PHYSICAL != 0 {
@@ -203,7 +211,7 @@ impl Writer {
             nx_omap,
             vols,
             dirty: false,
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
             partition,
             mutations: 0,
             poisoned: None,
@@ -407,7 +415,9 @@ impl Writer {
     /// Drops every uncommitted change by reloading from disk, exactly like reopening after a crash.
     fn rollback(&mut self) {
         let passwords: Vec<_> = self.vols.iter().map(|v| v.password.clone()).collect();
-        let reopened = Writer::open(&self.path, self.partition).and_then(|mut fresh| {
+        // Reopen through our own handle: the exclusive-writer lock would refuse a second open.
+        let reopened = self.c.reopen().and_then(|c| Writer::from_container(c, &self.path, self.partition));
+        let reopened = reopened.and_then(|mut fresh| {
             for (v, pw) in passwords.iter().enumerate() {
                 if let Some(pw) = pw {
                     fresh.unlock(v, pw)?;

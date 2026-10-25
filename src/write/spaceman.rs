@@ -395,7 +395,7 @@ impl Spaceman {
                 out.push((leaf.oid, tree::serialize(&def, &leaf, bs)));
             }
         }
-        if out.len() + 1 > limit {
+        if out.len() > per_leaf || out.len() + 1 > limit {
             return Err(bad(format!("free queue needs {} nodes, limit is {limit}", out.len() + 1)));
         }
         if !self.fq[q].is_empty() {
@@ -422,7 +422,8 @@ impl Spaceman {
     pub(crate) fn main_queue_limit(&self) -> usize {
         let limit = u16le(&self.raw, 200 + 40 * SFQ_MAIN + 24) as usize;
         let per_leaf = (self.bs as usize - 56 - tree::INFO) / (16 + 8 + 4);
-        if limit <= 1 { per_leaf } else { (limit - 1) * per_leaf }
+        // A two-level tree: the root indexes at most `per_leaf` leaves.
+        if limit <= 1 { per_leaf } else { (limit - 1).min(per_leaf) * per_leaf }
     }
 }
 

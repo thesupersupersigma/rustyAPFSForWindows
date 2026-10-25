@@ -248,6 +248,11 @@ impl Writer {
     fn do_create(&mut self, v: usize, parent: u64, name: &str, kind: Kind, perm: u16) -> io::Result<u64> {
         self.writable(v)?;
         check_name(name)?;
+        if let Kind::Symlink(t) = &kind
+            && (t.is_empty() || t.len() > 1023 || t.contains('\0'))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "symlink target must be 1-1023 bytes"));
+        }
         let mut p = self.inode_rec(v, parent)?;
         if p.mode() & S_IFMT != S_IFDIR {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "parent is not a directory"));
@@ -406,9 +411,10 @@ impl Writer {
         while pos < end {
             let Some((rs, rlen, val)) = self.pext_at(v, pos)? else {
                 // No record: the block was exclusively owned without bookkeeping; drop it on release.
-                if delta < 0 {
-                    self.free(Some(v), pos, 1)?;
+                if delta > 0 {
+                    return Err(bad(format!("block {pos} has no extent-reference record")));
                 }
+                self.free(Some(v), pos, 1)?;
                 pos += 1;
                 continue;
             };
@@ -597,6 +603,7 @@ impl Writer {
 
     /// Writes `data` at byte `off` of regular file `ino`, growing it as needed.
     fn do_write_at(&mut self, v: usize, ino: u64, off: u64, data: &[u8]) -> io::Result<()> {
+        check_size(off.checked_add(data.len() as u64).ok_or_else(too_big)?)?;
         if data.is_empty() {
             return Ok(());
         }
@@ -744,6 +751,7 @@ impl Writer {
 
     /// Sets a regular file's size. Growing adds a hole; shrinking frees the blocks past the end.
     fn do_set_size(&mut self, v: usize, ino: u64, new_size: u64) -> io::Result<()> {
+        check_size(new_size)?;
         let (rec, old) = self.data_rec(v, ino)?;
         let bs = self.c.block_size;
         let size = rec.get(INO_DSTREAM).map_or(0, |d| u64le(d, 0));
@@ -877,6 +885,9 @@ impl Writer {
         if rec.mode() & S_IFMT == S_IFDIR {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "can't hard-link a directory"));
         }
+        if self.inode_rec(v, new_parent)?.mode() & S_IFMT != S_IFDIR {
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, "destination is not a directory"));
+        }
         if self.find_entry(v, new_parent, new_name)?.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{new_name:?} already exists")));
         }
@@ -959,34 +970,43 @@ impl Writer {
         {
             return Ok(()); // both names are links to the same file: POSIX says do nothing
         }
-        if let Some(dst) = dst
-            && dst.id != src.id
-        {
-            if !replace {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{new_name:?} already exists")));
-            }
-            let (s, d) = (self.inode_rec(v, src.id)?, self.inode_rec(v, dst.id)?);
-            if (s.mode() & S_IFMT == S_IFDIR) != (d.mode() & S_IFMT == S_IFDIR) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "can't replace a file with a directory or back",
-                ));
-            }
-            self.do_remove(v, new_parent, new_name)?;
-        }
+        // Every check before the first change: a failure after it would roll back to the last commit.
         let mut rec = self.inode_rec(v, src.id)?;
+        let np = self.inode_rec(v, new_parent)?;
+        if np.mode() & S_IFMT != S_IFDIR {
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, "destination is not a directory"));
+        }
         if rec.mode() & S_IFMT == S_IFDIR && self.is_ancestor(v, src.id, new_parent)? {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "can't move a directory into itself"));
         }
         if rec.mode() & S_IFMT == S_IFDIR
             && parent != new_parent
-            && dirstat_of(&self.inode_rec(v, parent)?) != dirstat_of(&self.inode_rec(v, new_parent)?)
+            && dirstat_of(&self.inode_rec(v, parent)?) != dirstat_of(&np)
         {
             // shortcut: would need rewriting the whole subtree's statistics membership.
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "moving a folder into or out of a folder that tracks its size isn't supported",
             ));
+        }
+        if let Some(dst) = &dst
+            && dst.id != src.id
+        {
+            if !replace {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{new_name:?} already exists")));
+            }
+            let d = self.inode_rec(v, dst.id)?;
+            if (rec.mode() & S_IFMT == S_IFDIR) != (d.mode() & S_IFMT == S_IFDIR) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "can't replace a file with a directory or back",
+                ));
+            }
+            if d.mode() & S_IFMT == S_IFDIR && d.nlink() != 0 {
+                return Err(io::Error::new(io::ErrorKind::DirectoryNotEmpty, format!("{new_name:?} is not empty")));
+            }
+            self.do_remove(v, new_parent, new_name)?;
+            rec = self.inode_rec(v, src.id)?;
         }
         let before = self.size_owner(v, &rec)?;
         let now = now();
@@ -1144,6 +1164,17 @@ fn dirstat_of(rec: &InodeRec) -> Option<u64> {
     rec.get(INO_DIR_STATS).filter(|d| d.len() >= 8).map(|d| u64le(d, 0))
 }
 
+/// Extent lengths are 56-bit; keep files comfortably below that.
+const MAX_FILE_SIZE: u64 = 1 << 55;
+
+fn check_size(size: u64) -> io::Result<()> {
+    if size > MAX_FILE_SIZE { Err(too_big()) } else { Ok(()) }
+}
+
+fn too_big() -> io::Error {
+    io::Error::new(io::ErrorKind::FileTooLarge, "file would be larger than APFS allows")
+}
+
 fn check_name(name: &str) -> io::Result<()> {
     if name.is_empty() || name.len() > 255 || name.contains(['/', '\0']) || name == "." || name == ".." {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid file name {name:?}")));
@@ -1265,12 +1296,54 @@ impl Writer {
 
     /// Sets a regular file's size. Growing adds a hole; shrinking frees the blocks past the end.
     pub fn set_size(&mut self, v: usize, ino: u64, size: u64) -> io::Result<()> {
+        self.free_gradually(v, ino, size)?;
         self.atomic(TINY, |w| w.do_set_size(v, ino, size))
     }
 
     /// Removes the entry `name` from `parent`; deletes the inode when its last link goes.
     pub fn remove(&mut self, v: usize, parent: u64, name: &str) -> io::Result<()> {
+        if let Some(e) = self.find_entry(v, parent, name)?
+            && let Ok(rec) = self.inode_rec(v, e.id)
+            && rec.mode() & S_IFMT == S_IFREG
+            && rec.nlink() <= 1
+        {
+            self.free_gradually(v, e.id, 0)?;
+        }
         self.atomic(TINY, |w| w.do_remove(v, parent, name))
+    }
+
+    /// Before cutting file `ino` down to `size`, frees its blocks past that point in steps with a
+    /// commit in between, and makes room in the free queue: one commit may only queue as many freed
+    /// ranges as the free queue can describe (Apple deletes big files incrementally too).
+    fn free_gradually(&mut self, v: usize, ino: u64, size: u64) -> io::Result<()> {
+        let budget = (self.sm.main_queue_limit() / 3).max(1);
+        loop {
+            let rec = self.inode_rec(v, ino)?;
+            let private = rec.u64(8);
+            if rec.mode() & S_IFMT != S_IFREG || self.dstream_refs(v, private)? > 1 {
+                return Ok(()); // releasing a shared stream frees nothing
+            }
+            let keep = size.div_ceil(self.c.block_size) * self.c.block_size;
+            let doomed: Vec<u64> = self
+                .extents(v, private)?
+                .iter()
+                .filter(|e| e.phys != 0 && e.logical + e.len > keep)
+                .map(|e| e.logical)
+                .collect();
+            for _ in 0..3 {
+                if self.sm.main_queue_len() + doomed.len().min(budget) <= self.sm.main_queue_limit() * 2 / 3 {
+                    break;
+                }
+                self.dirty = true;
+                self.commit()?;
+            }
+            if doomed.len() <= budget {
+                return Ok(());
+            }
+            let cut = doomed[doomed.len() - budget].max(keep);
+            self.atomic(TINY, |w| w.do_set_size(v, ino, cut))?;
+            self.commit()?;
+        }
     }
 
     /// Adds a hard link `new_parent/new_name` to the existing file `ino`.

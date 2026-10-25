@@ -45,6 +45,11 @@ impl Container {
         Self::open_dev(Device::open(path, true, partition)?)
     }
 
+    /// Re-reads the container from disk through the same device handle (dropping the overlay).
+    pub(crate) fn reopen(&self) -> io::Result<Container> {
+        Self::open_dev(self.dev.try_clone()?)
+    }
+
     fn open_dev(dev: Device) -> io::Result<Container> {
         let mut c = Container {
             dev,

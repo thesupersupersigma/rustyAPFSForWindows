@@ -259,6 +259,7 @@ pub(crate) fn serialize(def: &Def, node: &Node, bs: usize) -> Vec<u8> {
     if node.root {
         b[bs - INFO..].copy_from_slice(&node.info);
     }
+    assert!(val_end - voff >= key_start + koff, "B-tree node overflow ({} records)", node.entries.len());
     super::seal(&mut b);
     b
 }
