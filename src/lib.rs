@@ -1,4 +1,4 @@
-//! Read-only APFS reader, built from Apple's "Apple File System Reference".
+//! APFS reader and writer, built from Apple's "Apple File System Reference".
 
 mod btree;
 mod compress;
@@ -8,6 +8,7 @@ mod device;
 #[cfg(windows)]
 pub mod mount;
 mod volume;
+pub mod write;
 
 pub use container::Container;
 pub use device::{Partition, apfs_partitions};

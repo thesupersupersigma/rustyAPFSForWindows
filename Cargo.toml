@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 aes = "0.9.3"
 aes-kw = "0.3.1"
+caseless = "0.2.2"
 flate2 = "1.1.10"
 hmac = "0.13.0"
 lzfse_rust = "0.2.1"

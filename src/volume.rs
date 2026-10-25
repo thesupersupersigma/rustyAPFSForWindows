@@ -121,6 +121,11 @@ enum Data {
 }
 
 impl<'c> Volume<'c> {
+    /// A view at `xid` whose object map tree root is already known (used by the writer).
+    pub(crate) fn with_root(c: &'c Container, sb: Vec<u8>, xid: u64, omap_tree: u64) -> io::Result<Volume<'c>> {
+        Self::with_omap(c, sb, xid, Some(omap_tree), None)
+    }
+
     pub(crate) fn new(c: &'c Container, sb: Vec<u8>, xid: u64) -> io::Result<Volume<'c>> {
         Self::with_omap(c, sb, xid, None, None)
     }
@@ -191,7 +196,7 @@ impl<'c> Volume<'c> {
     }
 
     /// Visits every file-system record of type `ty` for object `oid`, in key order.
-    fn records(&self, oid: u64, ty: u8, visit: btree::Visit) -> io::Result<()> {
+    pub(crate) fn records(&self, oid: u64, ty: u8, visit: btree::Visit) -> io::Result<()> {
         if self.is_locked() {
             return Err(locked());
         }
@@ -241,26 +246,42 @@ impl<'c> Volume<'c> {
     pub fn lookup(&self, path: &str) -> io::Result<Inode> {
         let mut id = ROOT_DIR_INO;
         for part in path.split('/').filter(|p| !p.is_empty()) {
-            // shortcut: linear scan of the directory instead of a hash-keyed B-tree search; fine for
-            // a CLI, switch to hashed lookup before mounting huge directories.
-            let entry = self.read_dir(id)?.into_iter().find(|e| self.names_match(&e.name, part));
-            id = entry.ok_or_else(|| not_found(path.to_string()))?.id;
+            id = self.find_child(id, part)?.ok_or_else(|| not_found(path.to_string()))?;
         }
         self.inode(id)
     }
 
-    fn names_match(&self, stored: &str, wanted: &str) -> bool {
-        if stored == wanted {
-            return true;
+    /// Finds `name` in directory `dir` (case/normalization rules of the volume), returning its inode id.
+    pub fn find_child(&self, dir: u64, name: &str) -> io::Result<Option<u64>> {
+        let ci = self.case_insensitive();
+        // Hashed volumes: only records with the name's hash can match. ASCII folding is unambiguous;
+        // for other names also fall back to a scan in case Apple's case folding differs from ours.
+        if self.hashed_names() {
+            let hash = crate::write::name_hash(ci, name);
+            let mut found = None;
+            self.scan(&|k: &[u8]| drec_hash_cmp(k, dir, hash), &mut |k, v| {
+                if names_match(ci, &cstr(&k[12..]), name) {
+                    found = Some(u64le(slice(v, 0, 8)?, 0));
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            if found.is_some() || name.is_ascii() {
+                return Ok(found);
+            }
         }
-        // Always normalization-insensitive after an exact miss: Windows typically sends composed (NFC) names
-        // while macOS often stores decomposed (NFD) ones, even on volumes without the flag.
-        if self.case_insensitive() {
-            // shortcut: to_lowercase approximates Unicode case folding; differs for a few chars (e.g. 'ß').
-            stored.nfd().flat_map(char::to_lowercase).eq(wanted.nfd().flat_map(char::to_lowercase))
-        } else {
-            stored.nfd().eq(wanted.nfd())
+        Ok(self.read_dir(dir)?.into_iter().find(|e| names_match(ci, &e.name, name)).map(|e| e.id))
+    }
+
+    /// Visits file-system tree records in key order whose key `cmp` reports `Equal`.
+    pub(crate) fn scan(&self, cmp: &dyn Fn(&[u8]) -> Ordering, visit: btree::Visit) -> io::Result<()> {
+        if self.is_locked() {
+            return Err(locked());
         }
+        let resolve = |child: u64| {
+            if self.physical_tree { Ok(child) } else { self.c.omap_lookup(self.omap_tree, child, self.xid) }
+        };
+        btree::walk_key(self.c, self.root_tree, &resolve, cmp, visit, self.key.as_deref())
     }
 
     pub fn xattr_names(&self, id: u64) -> io::Result<Vec<String>> {
@@ -483,6 +504,30 @@ fn cstr(b: &[u8]) -> String {
 
 fn locked() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "volume is encrypted: unlock it with its password first")
+}
+
+/// Orders a file-system key against the directory records of `dir` with name hash `hash`.
+pub(crate) fn drec_hash_cmp(k: &[u8], dir: u64, hash: u32) -> Ordering {
+    if k.len() < 8 {
+        return Ordering::Less; // malformed key: skip it rather than panic
+    }
+    let h = u64le(k, 0);
+    // The record type lives in the top bits, but the tree sorts by object id first.
+    (h & OBJ_ID_MASK, h >> 60)
+        .cmp(&(dir, APFS_TYPE_DIR_REC as u64))
+        .then_with(|| if k.len() < 12 { Ordering::Less } else { (u32le(k, 8) >> 10).cmp(&hash) })
+}
+
+/// The form names are compared (and hashed) in: NFD, and case-folded on case-insensitive volumes.
+pub(crate) fn fold_name(case_insensitive: bool, name: &str) -> String {
+    let nfd: String = name.nfd().collect();
+    if case_insensitive { caseless::default_case_fold_str(&nfd).nfd().collect() } else { nfd }
+}
+
+/// Name equality as the volume sees it. Always normalization-insensitive: Windows typically sends
+/// composed (NFC) names while macOS often stores decomposed (NFD) ones, even on volumes without the flag.
+pub(crate) fn names_match(case_insensitive: bool, stored: &str, wanted: &str) -> bool {
+    stored == wanted || fold_name(case_insensitive, stored) == fold_name(case_insensitive, wanted)
 }
 
 fn not_found(what: String) -> io::Error {

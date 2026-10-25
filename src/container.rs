@@ -1,8 +1,10 @@
 use crate::crypto::Xts;
 use crate::device::Device;
 use crate::{Volume, bad, btree, u32le, u64le};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 
 pub(crate) const OBJ_PHYSICAL: u32 = 0x4000_0000;
 pub(crate) const OBJECT_TYPE_NX_SUPERBLOCK: u32 = 0x1;
@@ -14,7 +16,7 @@ const NX_MAGIC: &[u8; 4] = b"NXSB";
 
 /// An APFS container: the whole partition or image, holding one or more volumes.
 pub struct Container {
-    dev: Device,
+    pub(crate) dev: Device,
     pub block_size: u64,
     /// Transaction id of the checkpoint we mounted.
     pub xid: u64,
@@ -22,7 +24,9 @@ pub struct Container {
     pub superblock: Vec<u8>,
     /// Newer checkpoints we rejected, newest first, with the reason.
     pub skipped: Vec<String>,
-    omap_tree: u64,
+    pub(crate) omap_tree: u64,
+    /// Metadata blocks written by the open transaction but not yet on disk; reads see these first.
+    pub(crate) overlay: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
 impl Container {
@@ -37,8 +41,20 @@ impl Container {
         Self::open_dev(Device::open(path.as_ref(), false, Some(n))?)
     }
 
+    pub(crate) fn open_rw(path: &Path, partition: Option<usize>) -> io::Result<Container> {
+        Self::open_dev(Device::open(path, true, partition)?)
+    }
+
     fn open_dev(dev: Device) -> io::Result<Container> {
-        let mut c = Container { dev, block_size: 4096, xid: 0, superblock: vec![], skipped: vec![], omap_tree: 0 };
+        let mut c = Container {
+            dev,
+            block_size: 4096,
+            xid: 0,
+            superblock: vec![],
+            skipped: vec![],
+            omap_tree: 0,
+            overlay: Mutex::new(HashMap::new()),
+        };
 
         let b0 = c.read_block(0)?;
         if &b0[32..36] != NX_MAGIC {
@@ -87,6 +103,9 @@ impl Container {
     }
 
     pub fn read_block(&self, paddr: u64) -> io::Result<Vec<u8>> {
+        if let Some(b) = self.overlay.lock().unwrap().get(&paddr) {
+            return Ok(b.clone());
+        }
         let mut buf = vec![0; self.block_size as usize];
         self.read_at(paddr * self.block_size, &mut buf)?;
         Ok(buf)

@@ -66,6 +66,31 @@ impl Device {
         Ok(())
     }
 
+    /// Writes whole aligned blocks (all writers in this crate write full blocks).
+    pub(crate) fn write_at(&self, off: u64, buf: &[u8]) -> io::Result<()> {
+        if !off.is_multiple_of(ALIGN) || !(buf.len() as u64).is_multiple_of(ALIGN) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "unaligned device write"));
+        }
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = self.base + off + done as u64;
+            #[cfg(windows)]
+            let n = std::os::windows::fs::FileExt::seek_write(&self.file, &buf[done..], pos)?;
+            #[cfg(unix)]
+            let n = std::os::unix::fs::FileExt::write_at(&self.file, &buf[done..], pos)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "device accepted no bytes"));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Makes previous writes durable (FlushFileBuffers on Windows).
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
     /// Reads until `buf` is full or the end of the device; returns the byte count.
     fn read_some(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         let mut done = 0;
