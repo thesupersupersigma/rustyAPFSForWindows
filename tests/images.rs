@@ -205,3 +205,38 @@ fn large_file_reads_only_what_is_asked() {
     assert_eq!(f.read_at(ino.size - 100, &mut buf).unwrap(), 100);
     assert_eq!(f.read_at(ino.size, &mut buf).unwrap(), 0);
 }
+
+#[test]
+fn finds_apfs_partition_in_gpt_disk() {
+    use std::io::Write;
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ignored/testdata/case_insensitive.bin");
+    let img = std::fs::read(&src).unwrap();
+    // 512-byte-sector GPT: header in LBA 1, 4 entries in LBA 2, a non-APFS partition first, APFS at LBA 2048.
+    let mut disk = vec![0u8; 2048 * 512];
+    disk[512..520].copy_from_slice(b"EFI PART");
+    disk[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes());
+    disk[512 + 80..512 + 84].copy_from_slice(&4u32.to_le_bytes());
+    disk[512 + 84..512 + 88].copy_from_slice(&128u32.to_le_bytes());
+    let entry = |i: usize| 1024 + 128 * i;
+    disk[entry(0)..entry(0) + 16].fill(0x11); // some other partition type
+    let apfs = [0xef, 0x57, 0x34, 0x7c, 0, 0, 0xaa, 0x11, 0xaa, 0x11, 0, 0x30, 0x65, 0x43, 0xec, 0xac];
+    disk[entry(1)..entry(1) + 16].copy_from_slice(&apfs);
+    disk[entry(1) + 32..entry(1) + 40].copy_from_slice(&2048u64.to_le_bytes());
+    disk[entry(1) + 40..entry(1) + 48].copy_from_slice(&(2048 + img.len() as u64 / 512 - 1).to_le_bytes());
+    for (i, c) in "Mac HD".encode_utf16().enumerate() {
+        disk[entry(1) + 56 + 2 * i..entry(1) + 58 + 2 * i].copy_from_slice(&c.to_le_bytes());
+    }
+    disk.extend_from_slice(&img);
+    let path = std::env::temp_dir().join(format!("rusty-apfs-gpt-{}.img", std::process::id()));
+    std::fs::File::create(&path).unwrap().write_all(&disk).unwrap();
+
+    let parts = rusty_apfs::apfs_partitions(&path).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!((parts[0].index, parts[0].offset, parts[0].name.as_str()), (1, 2048 * 512, "Mac HD"));
+    let c = Container::open(&path).unwrap();
+    let v = single_volume(&c, "Case Insensitive", 0x1);
+    assert_eq!(read(&v, "dir/file"), "\u{f8ff} File System\n".as_bytes());
+    assert!(Container::open_partition(&path, 1).is_err());
+    drop(c);
+    std::fs::remove_file(&path).unwrap();
+}

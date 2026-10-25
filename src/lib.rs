@@ -3,9 +3,11 @@
 mod btree;
 mod compress;
 mod container;
+mod device;
 mod volume;
 
 pub use container::Container;
+pub use device::{Partition, apfs_partitions};
 pub use volume::{DirEntry, File, Inode, Snapshot, Volume};
 
 use std::io;

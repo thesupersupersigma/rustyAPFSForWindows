@@ -1,5 +1,5 @@
+use crate::device::Device;
 use crate::{Volume, bad, btree, u32le, u64le};
-use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -13,7 +13,7 @@ const NX_MAGIC: &[u8; 4] = b"NXSB";
 
 /// An APFS container: the whole partition or image, holding one or more volumes.
 pub struct Container {
-    file: fs::File,
+    dev: Device,
     pub block_size: u64,
     /// Transaction id of the checkpoint we mounted.
     pub xid: u64,
@@ -25,9 +25,19 @@ pub struct Container {
 }
 
 impl Container {
+    /// Opens an image, a bare APFS partition, or the first APFS partition of a GPT disk
+    /// (e.g. `\\.\PhysicalDrive1`, which needs admin rights).
     pub fn open(path: impl AsRef<Path>) -> io::Result<Container> {
-        let file = fs::File::open(path)?;
-        let mut c = Container { file, block_size: 4096, xid: 0, superblock: vec![], skipped: vec![], omap_tree: 0 };
+        Self::open_dev(Device::open(path.as_ref(), false, None)?)
+    }
+
+    /// Opens the `n`-th APFS partition (0-based, see `apfs_partitions`) of a GPT disk.
+    pub fn open_partition(path: impl AsRef<Path>, n: usize) -> io::Result<Container> {
+        Self::open_dev(Device::open(path.as_ref(), false, Some(n))?)
+    }
+
+    fn open_dev(dev: Device) -> io::Result<Container> {
+        let mut c = Container { dev, block_size: 4096, xid: 0, superblock: vec![], skipped: vec![], omap_tree: 0 };
 
         let b0 = c.read_block(0)?;
         if &b0[32..36] != NX_MAGIC {
@@ -81,19 +91,8 @@ impl Container {
         Ok(buf)
     }
 
-    pub(crate) fn read_at(&self, mut off: u64, mut buf: &mut [u8]) -> io::Result<()> {
-        while !buf.is_empty() {
-            #[cfg(windows)]
-            let n = std::os::windows::fs::FileExt::seek_read(&self.file, buf, off)?;
-            #[cfg(unix)]
-            let n = std::os::unix::fs::FileExt::read_at(&self.file, buf, off)?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("read past end at byte {off}")));
-            }
-            off += n as u64;
-            buf = &mut buf[n..];
-        }
-        Ok(())
+    pub(crate) fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.dev.read_at(off, buf)
     }
 
     /// Reads a physical object and checks its checksum and type.

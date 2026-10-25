@@ -15,7 +15,7 @@ Built from Apple's public [Apple File System Reference](https://developer.apple.
 | Compressed files (zlib, LZVN, LZFSE, inline and resource fork) | done |
 | Snapshots (read-only views) | done |
 | Encrypted volumes | not yet (detected and refused) |
-| Physical disks / GPT partitions | not yet (disk images only) |
+| Physical disks / GPT partitions | done (`apfs list`, needs admin) |
 | Mounting as a drive letter (WinFsp) | not yet |
 | Writing | not yet |
 

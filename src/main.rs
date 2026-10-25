@@ -2,7 +2,8 @@ use rusty_apfs::{Container, Volume};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: apfs <image> info
+const USAGE: &str = "usage: apfs list                      (APFS partitions on physical disks; needs admin)
+       apfs <image|disk> info [--partition N]
        apfs <image> ls  [path] [--volume N] [--snapshot NAME]
        apfs <image> cat <path> [--volume N] [--snapshot NAME]";
 
@@ -24,9 +25,16 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
     };
     let vol_idx: usize = opt(&mut args, "--volume").map_or(Ok(0), |v| v.parse()).map_err(|_| usage())?;
     let snap = opt(&mut args, "--snapshot");
+    let partition: Option<usize> = opt(&mut args, "--partition").map(|p| p.parse()).transpose().map_err(|_| usage())?;
+    if args.first().map(String::as_str) == Some("list") {
+        return list();
+    }
     let [image, cmd, rest @ ..] = args.as_slice() else { return Err(usage()) };
 
-    let c = Container::open(image)?;
+    let c = match partition {
+        Some(n) => Container::open_partition(image, n)?,
+        None => Container::open(image)?,
+    };
     if cmd == "info" {
         return info(&c);
     }
@@ -90,6 +98,23 @@ fn ls(vol: &Volume, path: &str) -> io::Result<()> {
             write!(out, " -> {}", vol.readlink(&ino)?)?;
         }
         writeln!(out)?;
+    }
+    Ok(())
+}
+
+fn list() -> io::Result<()> {
+    for n in 0..32 {
+        let disk = format!(r"\\.\PhysicalDrive{n}");
+        match rusty_apfs::apfs_partitions(&disk) {
+            Ok(parts) => {
+                for (i, p) in parts.iter().enumerate() {
+                    let gib = p.size as f64 / (1u64 << 30) as f64;
+                    println!("{disk} --partition {i}: {:?} {gib:.1} GiB at byte {}", p.name, p.offset);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => println!("{disk}: {e}"),
+        }
     }
     Ok(())
 }
