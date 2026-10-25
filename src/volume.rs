@@ -6,6 +6,8 @@ use std::cmp::Ordering;
 use std::io;
 use unicode_normalization::UnicodeNormalization;
 
+mod dump;
+
 const APFS_TYPE_SNAP_METADATA: u8 = 1;
 const APFS_TYPE_INODE: u8 = 3;
 const APFS_TYPE_XATTR: u8 = 4;

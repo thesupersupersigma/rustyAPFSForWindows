@@ -51,6 +51,7 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
     let path = rest.first().map_or("/", String::as_str);
     match cmd.as_str() {
         "ls" => ls(&vol, path),
+        "dump" => io::stdout().lock().write_all(vol.dump()?.as_bytes()),
         "cat" => {
             let f = vol.open(&vol.lookup(path)?)?;
             io::stdout().lock().write_all(&f.read_all()?)
