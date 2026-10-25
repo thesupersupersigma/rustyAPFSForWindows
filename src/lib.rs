@@ -3,6 +3,7 @@
 mod btree;
 mod compress;
 mod container;
+mod crypto;
 mod device;
 mod volume;
 

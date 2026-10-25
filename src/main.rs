@@ -3,9 +3,9 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: apfs list                      (APFS partitions on physical disks; needs admin)
-       apfs <image|disk> info [--partition N]
-       apfs <image> ls  [path] [--volume N] [--snapshot NAME]
-       apfs <image> cat <path> [--volume N] [--snapshot NAME]";
+       apfs <image|disk> info [--partition N] [--password PW]
+       apfs <image|disk> ls  [path] [--volume N] [--snapshot NAME] [--password PW]
+       apfs <image|disk> cat <path> [--volume N] [--snapshot NAME] [--password PW]";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -29,6 +29,7 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
     if args.first().map(String::as_str) == Some("list") {
         return list();
     }
+    let password = opt(&mut args, "--password");
     let [image, cmd, rest @ ..] = args.as_slice() else { return Err(usage()) };
 
     let c = match partition {
@@ -36,10 +37,14 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
         None => Container::open(image)?,
     };
     if cmd == "info" {
-        return info(&c);
+        return info(&c, password.as_deref());
     }
     let vols = c.volumes()?;
     let mut vol = vols.into_iter().nth(vol_idx).ok_or_else(|| io::Error::other(format!("no volume {vol_idx}")))?;
+    if vol.is_locked() {
+        let pw = password.ok_or_else(|| io::Error::other("volume is encrypted: pass --password"))?;
+        vol.unlock(&pw)?;
+    }
     if let Some(name) = snap {
         let s = vol
             .snapshots()?
@@ -60,19 +65,22 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
     }
 }
 
-fn info(c: &Container) -> io::Result<()> {
+fn info(c: &Container, password: Option<&str>) -> io::Result<()> {
     println!("block size {}, checkpoint xid {}", c.block_size, c.xid);
     for s in &c.skipped {
         println!("  {s}");
     }
-    for (i, v) in c.volumes()?.iter().enumerate() {
+    for (i, mut v) in c.volumes()?.into_iter().enumerate() {
         println!(
             "volume {i}: {:?} incompat={:#x}{}",
             v.name,
             v.incompatible_features,
             if v.encrypted { " (encrypted)" } else { "" }
         );
-        if !v.encrypted {
+        if let (true, Some(pw)) = (v.is_locked(), password) {
+            v.unlock(pw)?;
+        }
+        if !v.is_locked() {
             for s in v.snapshots()? {
                 println!("  snapshot {:?} xid={}", s.name, s.xid);
             }

@@ -1,9 +1,11 @@
 //! Volumes and the file-system tree (spec: "Volumes", "File-System Objects", "Data Streams", "Snapshot Metadata").
 
 use crate::container::{Container, OBJ_PHYSICAL, OBJECT_TYPE_FS};
+use crate::crypto::{self, Xts};
 use crate::{bad, btree, compress, slice, u16le, u32le, u64le};
 use std::cmp::Ordering;
 use std::io;
+use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
 mod dump;
@@ -19,6 +21,7 @@ pub const ROOT_DIR_INO: u64 = 2;
 const INCOMPAT_CASE_INSENSITIVE: u64 = 0x1;
 const INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x8;
 const APFS_FS_UNENCRYPTED: u64 = 0x1;
+const APFS_FS_ONEKEY: u64 = 0x8;
 const XATTR_DATA_STREAM: u16 = 0x1;
 const XATTR_DATA_EMBEDDED: u16 = 0x2;
 const INO_EXT_TYPE_DSTREAM: u8 = 8;
@@ -31,13 +34,15 @@ pub struct Volume<'c> {
     pub superblock: Vec<u8>,
     pub name: String,
     pub incompatible_features: u64,
-    /// Software-encrypted volumes have encrypted metadata; we can't read their trees yet.
+    /// Software-encrypted volumes encrypt their metadata and data; call `unlock` before reading.
     pub encrypted: bool,
     /// Transaction id this view reads at (a snapshot's xid for snapshot views).
     pub xid: u64,
     omap_tree: u64,
     root_tree: u64,
     physical_tree: bool,
+    /// Volume encryption key, once unlocked.
+    key: Option<Arc<Xts>>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,7 +103,8 @@ pub struct Snapshot {
 struct Extent {
     logical: u64,
     len: u64,
-    phys: u64, // 0 = sparse
+    phys: u64,      // 0 = sparse
+    crypto_id: u64, // ONEKEY volumes: tweak base in blocks (usually the original phys), so first sector = id * bs/512
 }
 
 /// An opened file's data. Compressed files are decompressed fully on open.
@@ -106,6 +112,7 @@ pub struct File<'c> {
     c: &'c Container,
     pub size: u64,
     data: Data,
+    key: Option<Arc<Xts>>,
 }
 
 enum Data {
@@ -115,10 +122,16 @@ enum Data {
 
 impl<'c> Volume<'c> {
     pub(crate) fn new(c: &'c Container, sb: Vec<u8>, xid: u64) -> io::Result<Volume<'c>> {
-        Self::with_omap(c, sb, xid, None)
+        Self::with_omap(c, sb, xid, None, None)
     }
 
-    fn with_omap(c: &'c Container, sb: Vec<u8>, xid: u64, omap_tree: Option<u64>) -> io::Result<Volume<'c>> {
+    fn with_omap(
+        c: &'c Container,
+        sb: Vec<u8>,
+        xid: u64,
+        omap_tree: Option<u64>,
+        key: Option<Arc<Xts>>,
+    ) -> io::Result<Volume<'c>> {
         if &sb[32..36] != b"APSB" {
             return Err(bad("volume superblock has no APSB magic"));
         }
@@ -133,13 +146,8 @@ impl<'c> Volume<'c> {
         };
         let physical_tree = u32le(&sb, 116) & OBJ_PHYSICAL != 0;
         let root_oid = u64le(&sb, 136);
-        let root_tree = if encrypted {
-            0
-        } else if physical_tree {
-            root_oid
-        } else {
-            c.omap_lookup(omap_tree, root_oid, xid)?
-        };
+        // The object map itself is never encrypted, so the root can be found before unlocking.
+        let root_tree = if physical_tree { root_oid } else { c.omap_lookup(omap_tree, root_oid, xid)? };
         Ok(Volume {
             c,
             superblock: sb,
@@ -150,7 +158,28 @@ impl<'c> Volume<'c> {
             omap_tree,
             root_tree,
             physical_tree,
+            key,
         })
+    }
+
+    /// Unlocks a software-encrypted volume with a user password (no-op for unencrypted volumes).
+    /// A wrong password fails with `ErrorKind::PermissionDenied`.
+    pub fn unlock(&mut self, password: &str) -> io::Result<()> {
+        if !self.encrypted || self.key.is_some() {
+            return Ok(());
+        }
+        if u64le(&self.superblock, 264) & APFS_FS_ONEKEY == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "volume uses per-file encryption keys (hardware encryption), which isn't supported",
+            ));
+        }
+        self.key = Some(Arc::new(crypto::unlock_volume(self.c, &self.superblock, password)?));
+        Ok(())
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.encrypted && self.key.is_none()
     }
 
     pub fn case_insensitive(&self) -> bool {
@@ -163,8 +192,8 @@ impl<'c> Volume<'c> {
 
     /// Visits every file-system record of type `ty` for object `oid`, in key order.
     fn records(&self, oid: u64, ty: u8, visit: btree::Visit) -> io::Result<()> {
-        if self.encrypted {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "volume is encrypted (not supported yet)"));
+        if self.is_locked() {
+            return Err(locked());
         }
         let resolve = |child: u64| {
             if self.physical_tree { Ok(child) } else { self.c.omap_lookup(self.omap_tree, child, self.xid) }
@@ -176,7 +205,7 @@ impl<'c> Volume<'c> {
             let h = u64le(k, 0);
             (h & OBJ_ID_MASK).cmp(&oid).then(((h >> 60) as u8).cmp(&ty))
         };
-        btree::walk(self.c, self.root_tree, &resolve, &cmp, visit)
+        btree::walk_key(self.c, self.root_tree, &resolve, &cmp, visit, self.key.as_deref())
     }
 
     pub fn inode(&self, id: u64) -> io::Result<Inode> {
@@ -271,15 +300,16 @@ impl<'c> Volume<'c> {
     fn file_from_stream(&self, dstream_id: u64, size: u64) -> io::Result<File<'c>> {
         let mut extents = vec![];
         self.records(dstream_id, APFS_TYPE_FILE_EXTENT, &mut |k, v| {
-            let v = slice(v, 0, 16)?;
+            let v = slice(v, 0, 24)?;
             extents.push(Extent {
                 logical: u64le(slice(k, 8, 8)?, 0),
                 len: u64le(v, 0) & 0x00ff_ffff_ffff_ffff,
                 phys: u64le(v, 8),
+                crypto_id: u64le(v, 16),
             });
             Ok(true)
         })?;
-        Ok(File { c: self.c, size, data: Data::Extents(extents) })
+        Ok(File { c: self.c, size, data: Data::Extents(extents), key: self.key.clone() })
     }
 
     pub fn open(&self, inode: &Inode) -> io::Result<File<'c>> {
@@ -292,12 +322,15 @@ impl<'c> Volume<'c> {
                 None
             };
             let data = compress::decompress(&decmpfs, rsrc.as_deref())?;
-            return Ok(File { c: self.c, size: data.len() as u64, data: Data::Memory(data) });
+            return Ok(File { c: self.c, size: data.len() as u64, data: Data::Memory(data), key: None });
         }
         self.file_from_stream(inode.private_id, inode.size)
     }
 
     pub fn snapshots(&self) -> io::Result<Vec<Snapshot>> {
+        if self.is_locked() {
+            return Err(locked());
+        }
         let tree = u64le(&self.superblock, 152);
         if tree == 0 {
             return Ok(vec![]);
@@ -308,26 +341,35 @@ impl<'c> Volume<'c> {
         let root = resolve(tree)?;
         let mut out = vec![];
         // The tree also holds name-index records; keep only the metadata ones.
-        btree::walk(self.c, root, &resolve, &|_| Ordering::Equal, &mut |k, v| {
-            let h = u64le(slice(k, 0, 8)?, 0);
-            if (h >> 60) as u8 == APFS_TYPE_SNAP_METADATA {
-                let name_len = u16le(slice(v, 48, 2)?, 0) as usize;
-                out.push(Snapshot {
-                    name: cstr(slice(v, 50, name_len)?),
-                    xid: h & OBJ_ID_MASK,
-                    create_time: u64le(v, 16),
-                    sblock: u64le(v, 8),
-                });
-            }
-            Ok(true)
-        })?;
+        let key = self.key.as_deref();
+        btree::walk_key(
+            self.c,
+            root,
+            &resolve,
+            &|_| Ordering::Equal,
+            &mut |k, v| {
+                let h = u64le(slice(k, 0, 8)?, 0);
+                if (h >> 60) as u8 == APFS_TYPE_SNAP_METADATA {
+                    let name_len = u16le(slice(v, 48, 2)?, 0) as usize;
+                    out.push(Snapshot {
+                        name: cstr(slice(v, 50, name_len)?),
+                        xid: h & OBJ_ID_MASK,
+                        create_time: u64le(v, 16),
+                        sblock: u64le(v, 8),
+                    });
+                }
+                Ok(true)
+            },
+            key,
+        )?;
         Ok(out)
     }
 
     /// A read-only view of the volume as it was when the snapshot was taken.
     pub fn snapshot(&self, s: &Snapshot) -> io::Result<Volume<'c>> {
         // Snapshot data is resolved through the live object map at the snapshot's xid.
-        Volume::with_omap(self.c, self.c.read_obj(s.sblock, OBJECT_TYPE_FS)?, s.xid, Some(self.omap_tree))
+        let sb = self.c.read_obj_key(s.sblock, OBJECT_TYPE_FS, self.key.as_deref())?;
+        Volume::with_omap(self.c, sb, s.xid, Some(self.omap_tree), self.key.clone())
     }
 }
 
@@ -354,10 +396,19 @@ impl File<'_> {
             let n = match hit {
                 Some(e) => {
                     let n = out.len().min((e.logical + e.len - pos) as usize);
+                    let rel = pos - e.logical;
                     if e.phys == 0 {
                         out[..n].fill(0);
+                    } else if let Some(k) = &self.key {
+                        // Decrypt whole 512-byte units; extents are block-sized, so they stay inside the extent.
+                        let first = rel / 512;
+                        let mut units = vec![0; ((rel + n as u64).div_ceil(512) - first) as usize * 512];
+                        self.c.read_at(e.phys * self.c.block_size + first * 512, &mut units)?;
+                        k.decrypt(&mut units, e.crypto_id * (self.c.block_size / 512) + first);
+                        let skip = (rel % 512) as usize;
+                        out[..n].copy_from_slice(&units[skip..skip + n]);
                     } else {
-                        self.c.read_at(e.phys * self.c.block_size + (pos - e.logical), &mut out[..n])?;
+                        self.c.read_at(e.phys * self.c.block_size + rel, &mut out[..n])?;
                     }
                     n
                 }
@@ -428,6 +479,10 @@ fn xfields(b: &[u8]) -> io::Result<Vec<(u8, &[u8])>> {
 /// Null-terminated UTF-8 from disk, lossily decoded.
 fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]).into_owned()
+}
+
+fn locked() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "volume is encrypted: unlock it with its password first")
 }
 
 fn not_found(what: String) -> io::Error {

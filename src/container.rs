@@ -1,3 +1,4 @@
+use crate::crypto::Xts;
 use crate::device::Device;
 use crate::{Volume, bad, btree, u32le, u64le};
 use std::io;
@@ -97,9 +98,21 @@ impl Container {
 
     /// Reads a physical object and checks its checksum and type.
     pub(crate) fn read_obj(&self, paddr: u64, want_type: u32) -> io::Result<Vec<u8>> {
-        let b = self.read_block(paddr)?;
+        self.read_obj_key(paddr, want_type, None)
+    }
+
+    /// Like `read_obj`, but a block that fails its checksum is decrypted with `key` and checked again.
+    /// Encrypted volumes encrypt their own trees, not the container's, so trying plaintext first is safe.
+    pub(crate) fn read_obj_key(&self, paddr: u64, want_type: u32, key: Option<&Xts>) -> io::Result<Vec<u8>> {
+        let mut b = self.read_block(paddr)?;
         if !checksum_ok(&b) {
-            return Err(bad(format!("bad checksum on object at block {paddr}")));
+            match key {
+                Some(k) => k.decrypt(&mut b, paddr * self.block_size / 512),
+                None => return Err(bad(format!("bad checksum on object at block {paddr}"))),
+            }
+            if !checksum_ok(&b) {
+                return Err(bad(format!("bad checksum on object at block {paddr} (also after decrypting)")));
+            }
         }
         let ty = u32le(&b, 24) & 0xffff;
         if ty != want_type {
