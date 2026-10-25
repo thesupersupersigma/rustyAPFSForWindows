@@ -339,6 +339,15 @@ fn to_path(name: &U16CStr) -> String {
     if p.is_empty() { "/".into() } else { p }
 }
 
+/// Folders Windows puts on every writable drive. Their Windows security settings can't be stored on
+/// APFS, so Explorer would call the Recycle Bin "corrupted" and offer to empty it; instead they don't
+/// exist here (and can't be created), so Explorer deletes permanently on this drive, as on network drives.
+fn windows_only(path: &str) -> bool {
+    let name = path.trim_start_matches('/');
+    !name.contains('/')
+        && (name.eq_ignore_ascii_case("$RECYCLE.BIN") || name.eq_ignore_ascii_case("System Volume Information"))
+}
+
 fn join(dir: &str, name: &str) -> String {
     if dir == "/" { format!("/{name}") } else { format!("{dir}/{name}") }
 }
@@ -356,6 +365,9 @@ impl FileSystemContext for ApfsFs {
             return Ok(sec);
         }
         let path = to_path(file_name);
+        if windows_only(&path) {
+            return Err(nt(STATUS_OBJECT_NAME_NOT_FOUND));
+        }
         let mut info = FileInfo::default();
         self.with(|vol| self.fill_info(vol, &vol.lookup(&path)?, &path, &mut info)).map_err(fsp)?;
         Ok(FileSecurity {
@@ -372,6 +384,9 @@ impl FileSystemContext for ApfsFs {
         _granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Handle> {
+        if windows_only(&to_path(file_name)) {
+            return Err(nt(STATUS_OBJECT_NAME_NOT_FOUND));
+        }
         let (id, stored) = self
             .with(|vol| {
                 let (ino, stored) = resolve(vol, &to_path(file_name))?;
@@ -402,6 +417,9 @@ impl FileSystemContext for ApfsFs {
             return Err(nt(STATUS_NOT_SUPPORTED)); // shortcut: creating symlinks from Windows isn't supported
         }
         let path = to_path(file_name);
+        if windows_only(&path) {
+            return Err(nt(STATUS_ACCESS_DENIED));
+        }
         let (dir, name) = split(&path);
         let id = self.change(|w, v| {
             let parent = w.view(v)?.lookup(dir)?;
@@ -498,6 +516,9 @@ impl FileSystemContext for ApfsFs {
         replace_if_exists: bool,
     ) -> winfsp::Result<()> {
         let (from, to) = (to_path(file_name), to_path(new_file_name));
+        if windows_only(&to) {
+            return Err(nt(STATUS_ACCESS_DENIED));
+        }
         let ((sd, sn), (dd, dn)) = (split(&from), split(&to));
         self.change(|w, v| {
             let (sp, dp) = {
@@ -669,6 +690,9 @@ impl FileSystemContext for ApfsFs {
                     }
                 }
                 for e in vol.read_dir(me.id)? {
+                    if path == "/" && windows_only(&e.name) {
+                        continue;
+                    }
                     let ino = vol.inode(e.id)?;
                     di.reset();
                     self.fill_info(vol, &ino, &join(&path, &e.name), di.file_info_mut())?;

@@ -61,6 +61,8 @@ Options: `--volume N` (default 0), `--partition N` (which APFS partition of a di
   refused while a volume is mounted read-write.
 - File names are limited to 255 bytes of UTF-8 (macOS's limit), so very long non-Latin names are refused.
 - Files copied from Windows get owner "unknown" (uid/gid 99), like files on any external Mac drive.
+- There's no Recycle Bin on APFS drives: deleting in Explorer deletes for good (it asks first). Windows'
+  `$RECYCLE.BIN` and `System Volume Information` folders aren't created on the drive.
 
 ## Build
 
