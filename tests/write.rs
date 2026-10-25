@@ -301,3 +301,48 @@ fn clones_share_until_written() {
     fsck(&p);
     assert_eq!(read(&p, "copy.bin"), edited);
 }
+
+/// Rough speed check: `cargo test --release --test write bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench() {
+    let p = fresh("bench", 1024, &["-L", "Bench"]);
+    let mut w = Writer::open(&p, None).unwrap();
+    let f = w.create(0, 2, "big.bin", Kind::File, 0o644).unwrap();
+    let chunk = pattern(1 << 20, 1);
+    let t = std::time::Instant::now();
+    for i in 0..256u64 {
+        w.write_at(0, f, i << 20, &chunk).unwrap();
+        if i % 64 == 63 {
+            w.commit().unwrap();
+        }
+    }
+    w.commit().unwrap();
+    let secs = t.elapsed().as_secs_f64();
+    println!("sequential write: 256 MiB in {secs:.2}s = {:.0} MiB/s", 256.0 / secs);
+    let d = w.create(0, 2, "many", Kind::Dir, 0o755).unwrap();
+    let t = std::time::Instant::now();
+    for i in 0..10_000 {
+        let f = w.create(0, d, &format!("file {i}.txt"), Kind::File, 0o644).unwrap();
+        w.write_at(0, f, 0, b"hello").unwrap();
+        if i % 1000 == 999 {
+            w.commit().unwrap();
+        }
+    }
+    w.commit().unwrap();
+    let secs = t.elapsed().as_secs_f64();
+    println!("10k small files in {secs:.2}s = {:.0} files/s", 10_000.0 / secs);
+    let t = std::time::Instant::now();
+    let v = w.view(0).unwrap();
+    let mut n = 0;
+    for i in (0..10_000).step_by(7) {
+        n += v.find_child(d, &format!("file {i}.txt")).unwrap().is_some() as usize;
+    }
+    println!("{n} lookups in {:.3}s", t.elapsed().as_secs_f64());
+    drop(v);
+    drop(w);
+    let t = std::time::Instant::now();
+    fsck(&p);
+    println!("apfsck {:.1}s", t.elapsed().as_secs_f64());
+    std::fs::remove_file(&p).unwrap();
+}

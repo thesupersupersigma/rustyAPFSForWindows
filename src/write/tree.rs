@@ -508,7 +508,14 @@ impl Writer {
                 node_delta -= 1;
             } else if fits(&def, &node, bs) {
                 let ptr = self.store(t, &def, &mut node)?;
-                parent.entries[idx] = (node.entries[0].0.clone(), ptr.to_le_bytes().to_vec());
+                let entry = (node.entries[0].0.clone(), ptr.to_le_bytes().to_vec());
+                if parent.entries[idx] == entry && def.virtual_vol.is_some() {
+                    // Virtual child kept its oid and first key: ancestors are unchanged except for the
+                    // root's record counts, so skip straight to the root.
+                    node = path.drain(..).next().map_or(parent, |(root, _)| root);
+                    continue;
+                }
+                parent.entries[idx] = entry;
             } else {
                 let mut pieces = split(&def, node.leaf(), std::mem::take(&mut node.entries), bs).into_iter();
                 node.entries = pieces.next().unwrap();
