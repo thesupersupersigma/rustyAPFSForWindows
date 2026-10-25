@@ -4,7 +4,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: apfs <image> info
        apfs <image> ls  [path] [--volume N] [--snapshot NAME]
-       apfs <image> cat <path> [--volume N] [--snapshot NAME]";
+       apfs <image> cat <path> [--volume N] [--snapshot NAME]
+       apfs <image> mount <X: | new-folder> [--volume N] [--snapshot NAME]";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -26,9 +27,10 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
     let snap = opt(&mut args, "--snapshot");
     let [image, cmd, rest @ ..] = args.as_slice() else { return Err(usage()) };
 
-    let c = Container::open(image)?;
+    // Leaked: it lives for the whole process, and the mount needs a 'static borrow.
+    let c: &'static Container = Box::leak(Box::new(Container::open(image)?));
     if cmd == "info" {
-        return info(&c);
+        return info(c);
     }
     let vols = c.volumes()?;
     let mut vol = vols.into_iter().nth(vol_idx).ok_or_else(|| io::Error::other(format!("no volume {vol_idx}")))?;
@@ -47,6 +49,8 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
             let f = vol.open(&vol.lookup(path)?)?;
             io::stdout().lock().write_all(&f.read_all()?)
         }
+        #[cfg(windows)]
+        "mount" => rusty_apfs::mount::mount(c, vol, rest.first().ok_or_else(usage)?),
         _ => Err(usage()),
     }
 }

@@ -3,6 +3,8 @@
 mod btree;
 mod compress;
 mod container;
+#[cfg(windows)]
+pub mod mount;
 mod volume;
 
 pub use container::Container;
