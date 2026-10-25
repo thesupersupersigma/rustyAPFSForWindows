@@ -50,13 +50,11 @@ struct App {
     /// One writer per container, shared by its mounted volumes; dropped when the last one unmounts.
     writers: HashMap<usize, Arc<Mutex<Writer>>>,
     status: String,
-    admin: bool,
 }
 
 impl App {
     fn new() -> App {
-        let mut app =
-            App { sources: vec![], active: vec![], writers: HashMap::new(), status: String::new(), admin: is_admin() };
+        let mut app = App { sources: vec![], active: vec![], writers: HashMap::new(), status: String::new() };
         app.scan_disks();
         // Images passed on the command line ("Open with", drag onto the exe).
         for path in std::env::args().skip(1) {
@@ -67,16 +65,14 @@ impl App {
         app
     }
 
-    /// Finds APFS partitions on physical disks (needs administrator rights) and reloads the volume
-    /// lists of everything shown. Sources are only ever added: mounts refer to them by index.
+    /// Finds APFS partitions on physical disks and reloads the volume lists of everything shown.
+    /// Sources are only ever added: mounts refer to them by index. (The exe's manifest makes Windows
+    /// start the app as administrator, which reading physical disks needs.)
     fn scan_disks(&mut self) {
         for s in 0..self.sources.len() {
             if !self.active.iter().any(|a| a.source == s) {
                 self.refresh(s);
             }
-        }
-        if !self.admin {
-            return;
         }
         for n in 0..32 {
             let disk = format!(r"\\.\PhysicalDrive{n}");
@@ -241,24 +237,9 @@ impl eframe::App for App {
                     }
                 });
             });
-            if !self.admin {
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 120, 0),
-                        "Reading physical disks needs administrator rights.",
-                    );
-                    if ui.button("Restart as administrator").clicked() {
-                        relaunch_as_admin();
-                    }
-                });
-            }
             ui.separator();
             if self.sources.is_empty() {
-                ui.label(if self.admin {
-                    "No APFS drives found. Plug one in and press Refresh."
-                } else {
-                    "Open a disk image, or restart as administrator to see drives."
-                });
+                ui.label("No APFS drives found. Plug one in and press Refresh, or open a disk image.");
             }
             let mut action = None;
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() - 30.0).show(
@@ -343,34 +324,5 @@ impl Drop for App {
         for a in self.active.drain(..) {
             let _ = a.session.stop();
         }
-    }
-}
-
-#[link(name = "shell32")]
-unsafe extern "system" {
-    fn IsUserAnAdmin() -> i32;
-    fn ShellExecuteW(
-        hwnd: isize,
-        op: *const u16,
-        file: *const u16,
-        params: *const u16,
-        dir: *const u16,
-        show: i32,
-    ) -> isize;
-}
-
-fn is_admin() -> bool {
-    // SAFETY: no arguments.
-    unsafe { IsUserAnAdmin() != 0 }
-}
-
-fn relaunch_as_admin() {
-    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let Ok(exe) = std::env::current_exe() else { return };
-    let (verb, file) = (wide("runas"), wide(&exe.display().to_string()));
-    // SAFETY: NUL-terminated UTF-16 strings that outlive the call.
-    let ok = unsafe { ShellExecuteW(0, verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1) } > 32;
-    if ok {
-        std::process::exit(0);
     }
 }

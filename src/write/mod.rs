@@ -128,15 +128,20 @@ impl Writer {
                 let o = 40 + 40 * m;
                 let (ty, subtype, size, oid, paddr) =
                     (u32le(&b, o), u32le(&b, o + 4), u32le(&b, o + 8), u64le(&b, o + 24), u64le(&b, o + 32));
-                if size as u64 != bs {
-                    return Err(unsupported(format!("multi-block ephemeral object (type {ty:#x})")));
+                // Big containers have a space manager spanning several blocks, stored contiguously.
+                let n = size as u64 / bs;
+                if n == 0 || !(size as u64).is_multiple_of(bs) {
+                    return Err(bad(format!("ephemeral object {oid} has size {size}")));
                 }
-                let data = c.read_block(paddr)?;
+                if paddr < data_base || paddr + n > data_base + data_blocks as u64 {
+                    return Err(bad("ephemeral object outside the checkpoint data area"));
+                }
+                let mut data = Vec::with_capacity(size as usize);
+                for i in 0..n {
+                    data.extend(c.read_block(paddr + i)?);
+                }
                 if !checksum_ok(&data) {
                     return Err(bad(format!("bad checksum on ephemeral object {oid}")));
-                }
-                if paddr < data_base || paddr >= data_base + data_blocks as u64 {
-                    return Err(bad("ephemeral object outside the checkpoint data area"));
                 }
                 eph_data.insert(oid, data.clone());
                 eph.push(Ephemeral { oid, ty, subtype, data });
@@ -508,24 +513,37 @@ impl Writer {
             objs.push((e.ty, e.subtype, e.oid, e.data.clone()));
         }
 
-        // Checkpoint data area: ephemeral objects, right after the current checkpoint's.
+        // Checkpoint data area: ephemeral objects back to back, right after the current checkpoint's.
+        // An object may not wrap past the end of the ring (readers map it linearly), so if the first
+        // (the possibly multi-block space manager) wouldn't fit there, the checkpoint starts at 0.
         let nx = &self.nx;
         let (desc_base, data_base) = (u64le(nx, 112), u64le(nx, 120));
         let (desc_blocks, data_blocks) = (u32le(nx, 104), u32le(nx, 108));
-        let (data_next, data_len) = (u32le(nx, 132), u32le(nx, 148));
+        let (data_next, data_index, data_len) = (u32le(nx, 132), u32le(nx, 144), u32le(nx, 148));
         let (desc_next, desc_len) = (u32le(nx, 128), u32le(nx, 140));
-        if objs.len() as u32 + data_len > data_blocks {
+        let blocks_of = |d: &Vec<u8>| (d.len() / bs) as u32;
+        let total: u32 = objs.iter().map(|o| blocks_of(&o.3)).sum();
+        let first = objs.first().map_or(1, |o| blocks_of(&o.3));
+        let start = if data_next + first > data_blocks { 0 } else { data_next };
+        let live = |i: u32| (i + data_blocks - data_index) % data_blocks < data_len;
+        if total > data_blocks || (0..total).any(|k| live((start + k) % data_blocks)) {
             return Err(bad("checkpoint data area too small"));
         }
         let mut maps = vec![];
-        let mut pos = data_next;
+        let mut pos = start;
         for (ty, subtype, oid, data) in objs {
+            let n = blocks_of(&data);
+            if pos + n > data_blocks {
+                return Err(bad("multi-block ephemeral object would wrap the checkpoint ring"));
+            }
             let paddr = data_base + pos as u64;
-            self.c.put_block(paddr, data);
-            maps.push((ty, subtype, oid, paddr));
-            pos = (pos + 1) % data_blocks;
+            for (i, block) in data.chunks(bs).enumerate() {
+                self.c.put_block(paddr + i as u64, block.to_vec());
+            }
+            maps.push((ty, subtype, oid, paddr, data.len() as u32));
+            pos = (pos + n) % data_blocks;
         }
-        let new_data = (data_next, maps.len() as u32, pos);
+        let new_data = (start, total, pos);
 
         // Checkpoint descriptor area: map block(s), then the superblock.
         let per_map = (bs - 40) / 40;
@@ -543,11 +561,11 @@ impl Writer {
             let last = i as u32 == n_maps - 1;
             b[32..36].copy_from_slice(&(last as u32).to_le_bytes());
             b[36..40].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
-            for (j, &(ty, subtype, oid, addr)) in chunk.iter().enumerate() {
+            for (j, &(ty, subtype, oid, addr, size)) in chunk.iter().enumerate() {
                 let o = 40 + 40 * j;
                 b[o..o + 4].copy_from_slice(&ty.to_le_bytes());
                 b[o + 4..o + 8].copy_from_slice(&subtype.to_le_bytes());
-                b[o + 8..o + 12].copy_from_slice(&(bs as u32).to_le_bytes());
+                b[o + 8..o + 12].copy_from_slice(&size.to_le_bytes());
                 b[o + 24..o + 32].copy_from_slice(&oid.to_le_bytes());
                 b[o + 32..o + 40].copy_from_slice(&addr.to_le_bytes());
             }

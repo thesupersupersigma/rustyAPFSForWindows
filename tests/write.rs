@@ -233,6 +233,13 @@ fn big_container_with_cabs() {
     w.commit().unwrap();
     w.set_size(0, f, 1 << 20).unwrap();
     w.commit().unwrap();
+    // Enough commits to wrap the checkpoint rings (multi-block space managers must not straddle the end).
+    for i in 0..40u64 {
+        w.write_at(0, f, (1 << 20) + i, b"x").unwrap();
+        w.commit().unwrap();
+    }
+    w.set_size(0, f, 1 << 20).unwrap();
+    w.commit().unwrap();
     drop(w);
     assert_eq!(read(&p, "big.bin"), &data[..1 << 20]);
     fsck(&p);
@@ -419,4 +426,87 @@ fn second_writer_is_refused() {
     assert!(Container::open(&p).is_ok());
     drop(w);
     assert!(Writer::open(&p, None).is_ok());
+}
+
+/// macOS stores the space manager of big containers as a multi-block ephemeral object (mkapfs doesn't),
+/// so rewrite a fresh image's checkpoint that way: spaceman grows to two blocks, the objects after it
+/// shift by one. Then write and commit enough times to wrap the checkpoint ring.
+#[test]
+fn multi_block_space_manager() {
+    let p = fresh("multiblock-sm", 64, &["-L", "Multi"]);
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+        let blk = |f: &mut std::fs::File, n: u64| {
+            let mut b = vec![0u8; 4096];
+            f.seek(SeekFrom::Start(n * 4096)).unwrap();
+            f.read_exact(&mut b).unwrap();
+            b
+        };
+        let put = |f: &mut std::fs::File, n: u64, b: &[u8]| {
+            f.seek(SeekFrom::Start(n * 4096)).unwrap();
+            f.write_all(b).unwrap();
+        };
+        let u32_ = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_ = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let seal = |b: &mut [u8]| {
+            const M: u64 = 0xffff_ffff;
+            let (mut s1, mut s2) = (0u64, 0u64);
+            for w in b[8..].chunks_exact(4) {
+                s1 = (s1 + u32::from_le_bytes(w.try_into().unwrap()) as u64) % M;
+                s2 = (s2 + s1) % M;
+            }
+            let c1 = M - ((s1 + s2) % M);
+            let c2 = M - ((s1 + c1) % M);
+            b[0..8].copy_from_slice(&((c2 << 32) | c1).to_le_bytes());
+        };
+        let mut nx = blk(&mut f, 0);
+        let (desc_base, data_base) = (u64_(&nx, 112), u64_(&nx, 120));
+        let (desc_index, data_index) = (u32_(&nx, 136) as u64, u32_(&nx, 144));
+        let cpm_addr = desc_base + desc_index;
+        let mut cpm = blk(&mut f, cpm_addr);
+        let count = u32_(&cpm, 36) as usize;
+        // Objects in checkpoint-map order are back to back; move every one after the spaceman up a block.
+        let mut objs: Vec<(usize, u64, Vec<u8>)> = (0..count)
+            .map(|m| {
+                let o = 40 + 40 * m;
+                (o, u64_(&cpm, o + 32), blk(&mut f, u64_(&cpm, o + 32)))
+            })
+            .collect();
+        objs.sort_by_key(|o| o.1);
+        let sm_pos = objs.iter().position(|o| u32_(&cpm, o.0) & 0xffff == 5).unwrap();
+        for (o, paddr, data) in objs.iter().rev() {
+            if *paddr > objs[sm_pos].1 {
+                put(&mut f, paddr + 1, data);
+                cpm[o + 32..o + 40].copy_from_slice(&(paddr + 1).to_le_bytes());
+            }
+        }
+        let (o, sm_addr, sm) = &objs[sm_pos];
+        let mut big = sm.clone();
+        big.resize(8192, 0);
+        seal(&mut big);
+        put(&mut f, *sm_addr, &big);
+        cpm[o + 8..o + 12].copy_from_slice(&8192u32.to_le_bytes());
+        seal(&mut cpm);
+        put(&mut f, cpm_addr, &cpm);
+        let data_len = u32_(&nx, 148) + 1;
+        nx[148..152].copy_from_slice(&data_len.to_le_bytes());
+        let next = (data_index + data_len) % u32_(&nx, 108);
+        nx[132..136].copy_from_slice(&next.to_le_bytes());
+        seal(&mut nx);
+        put(&mut f, 0, &nx);
+        let sb_slot = desc_base + (desc_index + 1) % u32_(&nx, 104) as u64;
+        put(&mut f, sb_slot, &nx);
+        let _ = data_base;
+    }
+    fsck(&p); // our rewrite is itself a valid container
+    let mut w = Writer::open(&p, None).unwrap();
+    let f = w.create(0, 2, "f.txt", Kind::File, 0o644).unwrap();
+    for i in 0..70u64 {
+        w.write_at(0, f, i, b"y").unwrap();
+        w.commit().unwrap();
+    }
+    drop(w);
+    assert_eq!(read(&p, "f.txt"), vec![b'y'; 70]);
+    fsck(&p);
 }

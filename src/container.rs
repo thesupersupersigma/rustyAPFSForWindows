@@ -190,16 +190,18 @@ pub(crate) fn checksum_ok(block: &[u8]) -> bool {
     fletcher64(&block[8..]) == u64le(block, 0)
 }
 
-/// Fletcher-64 as defined in the spec ("Checksum"). The sums are reduced once at the end, which gives
-/// the same result as reducing every step and can't overflow for blocks up to 64 KiB.
+/// Fletcher-64 as defined in the spec ("Checksum"). The sums are reduced every 4096 words rather than
+/// every word: same result, and no overflow for objects of any size.
 pub(crate) fn fletcher64(data: &[u8]) -> u64 {
     const M: u64 = 0xffff_ffff;
     let (mut s1, mut s2) = (0u64, 0u64);
-    for w in data.chunks_exact(4) {
-        s1 += u32::from_le_bytes(w.try_into().unwrap()) as u64;
-        s2 += s1;
+    for chunk in data.chunks(4 * 4096) {
+        for w in chunk.chunks_exact(4) {
+            s1 += u32::from_le_bytes(w.try_into().unwrap()) as u64;
+            s2 += s1;
+        }
+        (s1, s2) = (s1 % M, s2 % M);
     }
-    let (s1, s2) = (s1 % M, s2 % M);
     let c1 = M - ((s1 + s2) % M);
     let c2 = M - ((s1 + c1) % M);
     (c2 << 32) | c1

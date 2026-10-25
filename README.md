@@ -31,8 +31,8 @@ and every write path is checked with an independent APFS checker (`apfsck`, see 
 
 ## Use it
 
-**App:** run `apfs-gui.exe`. It lists the APFS volumes on your disks (it offers to restart as administrator,
-which reading physical disks needs) and any image you open. Press **Mount** to get a drive letter; tick
+**App:** run `apfs-gui.exe` (Windows asks for administrator permission, which reading physical disks
+needs). It lists the APFS volumes on your disks and any image you open. Press **Mount** to get a drive letter; tick
 **Read-only** first if you only want to look. **Unmount** before unplugging the drive.
 
 **Command line:**
