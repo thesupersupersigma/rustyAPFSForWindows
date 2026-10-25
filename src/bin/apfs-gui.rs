@@ -107,11 +107,8 @@ impl App {
         };
         let src = &self.sources[s];
         let info = &src.volumes[v];
-        let result = if info.encrypted || info.read_only {
-            self.mount_read_only(s, v, &letter)
-        } else {
-            self.mount_through_writer(s, v, &letter)
-        };
+        let result =
+            if info.read_only { self.mount_read_only(s, v, &letter) } else { self.mount_through_writer(s, v, &letter) };
         match result {
             Ok((session, rw)) => {
                 self.status = format!(
@@ -121,7 +118,13 @@ impl App {
                 );
                 self.active.push(Active { source: s, vol: v, letter, rw, session });
             }
-            Err(e) => self.status = format!("Couldn't mount: {e}"),
+            Err(e) => {
+                // Don't keep the disk locked for writing by a mount that didn't happen.
+                if !self.active.iter().any(|a| a.source == s) {
+                    self.writers.remove(&s);
+                }
+                self.status = format!("Couldn't mount: {e}");
+            }
         }
     }
 
@@ -135,7 +138,13 @@ impl App {
                 w
             }
         };
-        let rw = w.lock().map_err(|_| std::io::Error::other("writer crashed"))?.read_only_reason(v).is_none();
+        let rw = {
+            let mut g = w.lock().map_err(|_| std::io::Error::other("writer crashed"))?;
+            if g.is_locked(v) {
+                g.unlock(v, &src.volumes[v].password)?;
+            }
+            g.read_only_reason(v).is_none()
+        };
         let session = mount::start_session(vec![mount::through_writer(&w, v, letter)?])?;
         Ok((session, rw))
     }
@@ -147,7 +156,7 @@ impl App {
             None => Container::open(&src.path)?,
         };
         // shortcut: the mount borrows the container for 'static, so each read-only mount leaks one
-        // container (a file handle and a few KB) until the app exits.
+        // container (a file handle and a few KB) until the app exits. Writable mounts don't.
         let c: &'static Container = Box::leak(Box::new(c));
         let mut vol = c.volumes()?.into_iter().nth(v).ok_or_else(|| std::io::Error::other("volume vanished"))?;
         if vol.is_locked() {

@@ -12,11 +12,13 @@ pub use fs::Kind;
 pub(crate) use fs::name_hash;
 
 use crate::container::{Container, OBJECT_TYPE_FS, OBJECT_TYPE_OMAP, checksum_ok, fletcher64};
+use crate::crypto::{self, Xts};
 use crate::{Volume, bad, u32le, u64le};
 use spaceman::{SFQ_IP, SFQ_MAIN, Spaceman};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tree::TreeId;
 
 const OBJECT_TYPE_SPACEMAN: u32 = 0x5;
@@ -24,6 +26,8 @@ const OBJECT_TYPE_CHECKPOINT_MAP: u32 = 0xc;
 const OBJ_PHYSICAL: u32 = 0x4000_0000;
 const NX_INCOMPAT_VERSION2: u64 = 0x2;
 const APFS_FS_UNENCRYPTED: u64 = 0x1;
+const APFS_FS_ONEKEY: u64 = 0x8;
+const OMAP_VAL_ENCRYPTED: u32 = 0x4;
 const INCOMPAT_CASE_INSENSITIVE: u64 = 0x1;
 const INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x8;
 const INCOMPAT_SEALED_VOLUME: u64 = 0x20;
@@ -44,9 +48,14 @@ pub(crate) struct Vol {
     sb_xid: u64,
     pub(crate) omap: OmapState,
     pub(crate) dirty: bool,
-    /// Why the volume can't be written, if it can't.
+    /// Why the volume can't be written, if it can't (encryption aside: see `key`).
     pub read_only: Option<String>,
     touched: bool,
+    /// Software-encrypted: file-system tree nodes and file data are encrypted with the volume key.
+    pub(crate) encrypted: bool,
+    pub(crate) key: Option<Arc<Xts>>,
+    /// Kept to unlock again after a rollback reopens the device.
+    password: Option<String>,
 }
 
 struct Ephemeral {
@@ -154,8 +163,9 @@ impl Writer {
             let sb = c.read_obj(sb_paddr, OBJECT_TYPE_FS)?;
             let omap = load_omap(u64le(&sb, 128))?;
             let incompat = u64le(&sb, 56);
-            let read_only = if u64le(&sb, 264) & APFS_FS_UNENCRYPTED == 0 {
-                Some("encrypted volumes are read-only")
+            let encrypted = u64le(&sb, 264) & APFS_FS_UNENCRYPTED == 0;
+            let read_only = if encrypted && u64le(&sb, 264) & APFS_FS_ONEKEY == 0 {
+                Some("volumes with per-file (hardware) encryption keys are read-only")
             } else if u64le(&sb, 216) != 0 {
                 Some("volumes with snapshots are read-only")
             } else if incompat & (INCOMPAT_SEALED_VOLUME | INCOMPAT_INCOMPLETE_RESTORE) != 0 || u64le(&sb, 1024) != 0 {
@@ -176,6 +186,9 @@ impl Writer {
                 dirty: false,
                 read_only: read_only.map(str::to_string),
                 touched: false,
+                encrypted,
+                key: None,
+                password: None,
             });
         }
         let txn = u64le(&nx, 96);
@@ -201,7 +214,29 @@ impl Writer {
 
     /// A read-only view of volume `v` including uncommitted changes. Don't keep it across writes.
     pub fn view(&self, v: usize) -> io::Result<Volume<'_>> {
-        Volume::with_root(&self.c, self.vols[v].sb.clone(), self.txn, self.vols[v].omap.tree)
+        let vol = &self.vols[v];
+        Volume::with_root(&self.c, vol.sb.clone(), self.txn, vol.omap.tree, vol.key.clone())
+    }
+
+    /// Unlocks a software-encrypted volume so it can be read and written (no-op otherwise).
+    /// A wrong password fails with `ErrorKind::PermissionDenied`.
+    pub fn unlock(&mut self, v: usize, password: &str) -> io::Result<()> {
+        let vol = &self.vols[v];
+        if !vol.encrypted || vol.key.is_some() {
+            return Ok(());
+        }
+        if u64le(&vol.sb, 264) & APFS_FS_ONEKEY == 0 {
+            return Err(unsupported("volume uses per-file encryption keys (hardware encryption)"));
+        }
+        let key = crypto::unlock_volume(&self.c, &vol.sb, password)?;
+        let vol = &mut self.vols[v];
+        vol.key = Some(Arc::new(key));
+        vol.password = Some(password.to_string());
+        Ok(())
+    }
+
+    pub fn is_locked(&self, v: usize) -> bool {
+        self.vols[v].encrypted && self.vols[v].key.is_none()
     }
 
     pub fn volume_count(&self) -> usize {
@@ -210,7 +245,10 @@ impl Writer {
 
     /// Why volume `v` can't be written, or None if it can.
     pub fn read_only_reason(&self, v: usize) -> Option<&str> {
-        self.vols[v].read_only.as_deref()
+        match self.vols[v].read_only.as_deref() {
+            None if self.is_locked(v) => Some("the volume is encrypted and locked: unlock it with its password"),
+            r => r,
+        }
     }
 
     pub fn free_blocks(&self) -> u64 {
@@ -291,7 +329,11 @@ impl Writer {
     }
 
     pub(crate) fn omap_map(&mut self, v: usize, oid: u64, paddr: u64) -> io::Result<()> {
-        let val = self.omap_val(paddr);
+        let mut val = self.omap_val(paddr);
+        // Only file-system tree nodes are mapped here, and on encrypted volumes they are stored encrypted.
+        if self.vols[v].encrypted {
+            val[0..4].copy_from_slice(&OMAP_VAL_ENCRYPTED.to_le_bytes());
+        }
         self.tree_put(TreeId::VolOmap(v), &Self::omap_key(oid, self.txn), &val).map(|_| ())
     }
 
@@ -364,7 +406,16 @@ impl Writer {
 
     /// Drops every uncommitted change by reloading from disk, exactly like reopening after a crash.
     fn rollback(&mut self) {
-        match Writer::open(&self.path, self.partition) {
+        let passwords: Vec<_> = self.vols.iter().map(|v| v.password.clone()).collect();
+        let reopened = Writer::open(&self.path, self.partition).and_then(|mut fresh| {
+            for (v, pw) in passwords.iter().enumerate() {
+                if let Some(pw) = pw {
+                    fresh.unlock(v, pw)?;
+                }
+            }
+            Ok(fresh)
+        });
+        match reopened {
             Ok(fresh) => *self = fresh,
             Err(e) => self.poisoned = Some(e.to_string()),
         }

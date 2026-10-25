@@ -4,10 +4,12 @@
 
 use super::Writer;
 use super::tree::TreeId;
+use crate::crypto::Xts;
 use crate::volume::{drec_hash_cmp, fold_name, names_match};
 use crate::{bad, u16le, u32le, u64le};
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 
 const T_PHYS_EXT: u64 = 2;
 const T_INODE: u64 = 3;
@@ -45,6 +47,8 @@ const PEXT_LEN_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 const T_SIBLING_LINK: u64 = 5;
 const T_SIBLING_MAP: u64 = 12;
 const DREC_EXT_TYPE_SIBLING_ID: u8 = 1;
+const FILE_EXTENT_CRYPTO_FLAG: u64 = 1 << 56;
+const CRYPTO_SW_ID: u64 = 4;
 const INODE_MAINTAIN_DIR_STATS: u64 = 0x2;
 const INODE_DIR_STATS_ORIGIN: u64 = 0x4;
 const INO_DIR_STATS: u8 = 10;
@@ -175,11 +179,14 @@ impl InodeRec {
 }
 
 /// A file extent: `len` bytes of the file starting at `logical`, stored at block `phys` (0 = hole).
+/// On encrypted volumes `crypto` is the AES-XTS tweak base in blocks (the extent's first physical block
+/// when it was written), so its first 512-byte unit uses tweak `crypto * bs / 512`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Ext {
     logical: u64,
     len: u64,
     phys: u64,
+    crypto: u64,
 }
 
 /// Directory entry found by `find_entry`.
@@ -191,8 +198,8 @@ pub(crate) struct Entry {
 
 impl Writer {
     fn writable(&self, v: usize) -> io::Result<()> {
-        match &self.vols[v].read_only {
-            Some(why) => Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, why.clone())),
+        match self.read_only_reason(v) {
+            Some(why) => Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, why.to_string())),
             None => Ok(()),
         }
     }
@@ -331,7 +338,12 @@ impl Writer {
     fn extents(&self, v: usize, dstream: u64) -> io::Result<Vec<Ext>> {
         let mut out = vec![];
         self.view(v)?.records(dstream, T_FILE_EXTENT as u8, &mut |k, val| {
-            out.push(Ext { logical: u64le(k, 8), len: u64le(val, 0) & 0x00ff_ffff_ffff_ffff, phys: u64le(val, 8) });
+            out.push(Ext {
+                logical: u64le(k, 8),
+                len: u64le(val, 0) & 0x00ff_ffff_ffff_ffff,
+                phys: u64le(val, 8),
+                crypto: u64le(val, 16),
+            });
             Ok(true)
         })?;
         Ok(out)
@@ -353,9 +365,7 @@ impl Writer {
         }
         for (l, e) in &new_l {
             if old_l.get(l) != Some(e) {
-                let mut val = vec![0u8; 24];
-                put64(&mut val, 0, e.len);
-                put64(&mut val, 8, e.phys);
+                let val = self.ext_val(v, e);
                 self.tree_put(TreeId::Fs(v), &fkey(*l), &val)?;
             }
         }
@@ -482,9 +492,7 @@ impl Writer {
         for e in &exts {
             let mut k = key(new_id, T_FILE_EXTENT);
             k.extend(e.logical.to_le_bytes());
-            let mut val = vec![0u8; 24];
-            put64(&mut val, 0, e.len);
-            put64(&mut val, 8, e.phys);
+            let val = self.ext_val(v, e);
             self.tree_put(TreeId::Fs(v), &k, &val)?;
             if e.phys != 0 {
                 self.adjust_refs(v, e.phys, e.len / bs, 1)?;
@@ -544,7 +552,9 @@ impl Writer {
 
     fn ensure_dstream(&mut self, v: usize, rec: &mut InodeRec) -> io::Result<()> {
         if rec.get(INO_DSTREAM).is_none() {
-            self.set_dstream(rec, |_| {});
+            let encrypted = self.vols[v].encrypted;
+            // Software-encrypted volumes name the one volume key as every stream's default crypto id.
+            self.set_dstream(rec, |d| put64(d, 16, if encrypted { CRYPTO_SW_ID } else { 0 }));
             self.tree_put(TreeId::Fs(v), &key(rec.u64(8), T_DSTREAM_ID), &1u32.to_le_bytes())?;
         }
         Ok(())
@@ -602,7 +612,7 @@ impl Writer {
         let (b0, b1) = (off / bs * bs, end.div_ceil(bs) * bs);
         let alloced = exts.last().map_or(0, |e| e.logical + e.len);
         if b1 > alloced {
-            exts.push(Ext { logical: alloced, len: b1 - alloced, phys: 0 });
+            exts.push(Ext { logical: alloced, len: b1 - alloced, phys: 0, crypto: 0 });
         }
         split_at(&mut exts, b0, bs);
         split_at(&mut exts, b1, bs);
@@ -618,12 +628,12 @@ impl Writer {
             } else if inside && cloned && self.shared(v, e.phys, e.len / bs)? {
                 // Blocks shared with a clone: copy, patch, write elsewhere.
                 let mut buf = vec![0u8; e.len as usize];
-                self.c.dev.read_at(e.phys * bs, &mut buf)?;
+                self.read_ext(v, &e, 0, &mut buf)?;
                 copy_overlap(&mut buf, e.logical, off, data);
                 out.extend(self.alloc_write(v, e.logical, &buf)?);
             } else {
                 if inside {
-                    self.overwrite(e, off, data)?;
+                    self.overwrite(v, e, off, data)?;
                 }
                 out.push(e);
             }
@@ -639,25 +649,72 @@ impl Writer {
         while done < buf.len() as u64 {
             let (start, n) = self.alloc(Some(v), (buf.len() as u64 - done) / bs)?;
             let len = n * bs;
-            self.c.dev.write_at(start * bs, &buf[done as usize..(done + len) as usize])?;
-            out.push(Ext { logical: logical + done, len, phys: start });
+            let e = Ext { logical: logical + done, len, phys: start, crypto: self.crypto_for(v, start) };
+            self.write_ext(v, &e, 0, &buf[done as usize..(done + len) as usize])?;
+            out.push(e);
             done += len;
         }
         Ok(out)
     }
 
     /// In-place write into an existing extent; partial blocks are read, patched and written back.
-    fn overwrite(&mut self, e: Ext, off: u64, data: &[u8]) -> io::Result<()> {
+    fn overwrite(&mut self, v: usize, e: Ext, off: u64, data: &[u8]) -> io::Result<()> {
         let bs = self.c.block_size;
         let end = off + data.len() as u64;
         let (s, t) = (off.max(e.logical) / bs * bs, end.min(e.logical + e.len).div_ceil(bs) * bs);
         let mut buf = vec![0u8; (t - s) as usize];
-        let dev_off = e.phys * bs + (s - e.logical);
         if s < off || t > end {
-            self.c.dev.read_at(dev_off, &mut buf)?;
+            self.read_ext(v, &e, s - e.logical, &mut buf)?;
         }
         copy_overlap(&mut buf, s, off, data);
-        self.c.dev.write_at(dev_off, &buf)
+        self.write_ext(v, &e, s - e.logical, &buf)
+    }
+
+    /// Crypto id for data newly written at `phys`: Apple uses the starting block; unencrypted volumes use 0.
+    fn crypto_for(&self, v: usize, phys: u64) -> u64 {
+        if self.vols[v].encrypted { phys } else { 0 }
+    }
+
+    /// The key file data is encrypted with on this volume, if any.
+    fn data_key(&self, v: usize) -> io::Result<Option<Arc<Xts>>> {
+        match (self.vols[v].encrypted, &self.vols[v].key) {
+            (false, _) => Ok(None),
+            (true, Some(k)) => Ok(Some(k.clone())),
+            (true, None) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "encrypted volume is locked")),
+        }
+    }
+
+    /// Reads whole blocks of extent `e` starting `rel` bytes into it, decrypting on encrypted volumes.
+    fn read_ext(&self, v: usize, e: &Ext, rel: u64, buf: &mut [u8]) -> io::Result<()> {
+        let bs = self.c.block_size;
+        self.c.dev.read_at(e.phys * bs + rel, buf)?;
+        if let Some(k) = self.data_key(v)? {
+            k.decrypt(buf, e.crypto * (bs / 512) + rel / 512);
+        }
+        Ok(())
+    }
+
+    /// Writes whole blocks of extent `e` starting `rel` bytes into it, encrypting on encrypted volumes.
+    fn write_ext(&self, v: usize, e: &Ext, rel: u64, buf: &[u8]) -> io::Result<()> {
+        let bs = self.c.block_size;
+        match self.data_key(v)? {
+            Some(k) => {
+                let mut b = buf.to_vec();
+                k.encrypt(&mut b, e.crypto * (bs / 512) + rel / 512);
+                self.c.dev.write_at(e.phys * bs + rel, &b)
+            }
+            None => self.c.dev.write_at(e.phys * bs + rel, buf),
+        }
+    }
+
+    /// The on-disk value of a file-extent record.
+    fn ext_val(&self, v: usize, e: &Ext) -> Vec<u8> {
+        let flags = if self.vols[v].encrypted && e.phys != 0 { FILE_EXTENT_CRYPTO_FLAG } else { 0 };
+        let mut val = vec![0u8; 24];
+        put64(&mut val, 0, e.len | flags);
+        put64(&mut val, 8, e.phys);
+        put64(&mut val, 16, e.crypto);
+        val
     }
 
     /// Zeroes the bytes after `size` in its last block, so growing the file never exposes stale data.
@@ -674,13 +731,14 @@ impl Writer {
         }
         split_at(exts, blk, bs);
         split_at(exts, blk + bs, bs);
-        let e = exts.iter_mut().find(|e| e.logical == blk).expect("split made this extent");
+        let e = *exts.iter().find(|e| e.logical == blk).expect("split made this extent");
         let mut buf = vec![0u8; bs as usize];
-        self.c.dev.read_at(e.phys * bs, &mut buf)?;
+        self.read_ext(v, &e, 0, &mut buf)?;
         buf[(size % bs) as usize..].fill(0);
         let (new, _) = self.alloc(Some(v), 1)?;
-        self.c.dev.write_at(new * bs, &buf)?;
-        exts.iter_mut().find(|e| e.logical == blk).unwrap().phys = new;
+        let moved = Ext { phys: new, crypto: self.crypto_for(v, new), ..e };
+        self.write_ext(v, &moved, 0, &buf)?;
+        *exts.iter_mut().find(|e| e.logical == blk).unwrap() = moved;
         Ok(())
     }
 
@@ -698,7 +756,7 @@ impl Writer {
             self.zero_tail(v, &mut exts, size)?;
             let alloced = exts.last().map_or(0, |e| e.logical + e.len);
             if want > alloced {
-                exts.push(Ext { logical: alloced, len: want - alloced, phys: 0 });
+                exts.push(Ext { logical: alloced, len: want - alloced, phys: 0, crypto: 0 });
             }
         } else {
             // Bytes past the new end stay until the file grows again; growing zeroes them (zero_tail).
@@ -1148,9 +1206,15 @@ fn split_at(exts: &mut Vec<Ext>, at: u64, bs: u64) {
         let e = exts[i];
         let head = at - e.logical;
         exts[i].len = head;
+        let skip = if e.phys == 0 { 0 } else { head / bs };
         exts.insert(
             i + 1,
-            Ext { logical: at, len: e.len - head, phys: if e.phys == 0 { 0 } else { e.phys + head / bs } },
+            Ext {
+                logical: at,
+                len: e.len - head,
+                phys: if e.phys == 0 { 0 } else { e.phys + skip },
+                crypto: if e.crypto == 0 { 0 } else { e.crypto + skip },
+            },
         );
     }
 }
@@ -1160,7 +1224,11 @@ fn merge(exts: Vec<Ext>, bs: u64) -> Vec<Ext> {
     let mut out: Vec<Ext> = vec![];
     for e in exts.into_iter().filter(|e| e.len > 0) {
         if let Some(last) = out.last_mut()
-            && ((last.phys == 0 && e.phys == 0) || (last.phys != 0 && last.phys + last.len / bs == e.phys))
+            && ((last.phys == 0 && e.phys == 0)
+                || (last.phys != 0
+                    && last.phys + last.len / bs == e.phys
+                    && (last.crypto == 0) == (e.crypto == 0)
+                    && (last.crypto == 0 || last.crypto + last.len / bs == e.crypto)))
         {
             last.len += e.len;
             continue;

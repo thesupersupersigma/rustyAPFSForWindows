@@ -321,9 +321,15 @@ impl Writer {
 
     pub(crate) fn load(&self, def: &Def, ptr: u64) -> io::Result<Node> {
         let addr = self.resolve(def, ptr)?;
-        let data = self.c.read_block(addr)?;
+        let mut data = self.c.read_block(addr)?;
         if !crate::container::checksum_ok(&data) {
-            return Err(bad(format!("bad checksum on B-tree node at block {addr}")));
+            match def.virtual_vol.and_then(|v| self.vols[v].key.clone()) {
+                Some(k) => k.decrypt(&mut data, addr * self.c.block_size / 512),
+                None => return Err(bad(format!("bad checksum on B-tree node at block {addr}"))),
+            }
+            if !crate::container::checksum_ok(&data) {
+                return Err(bad(format!("bad checksum on B-tree node at block {addr} (also after decrypting)")));
+            }
         }
         let mut n = parse(def, &data)?;
         n.addr = addr;
@@ -353,7 +359,15 @@ impl Writer {
             node.xid = self.txn;
         }
         let bs = self.c.block_size as usize;
-        self.c.put_block(node.addr, serialize(def, node, bs));
+        let mut block = serialize(def, node, bs);
+        // Encrypted volumes store their file-system tree nodes encrypted (checksum over the plaintext).
+        if let Some(v) = def.virtual_vol
+            && self.vols[v].encrypted
+        {
+            let key = self.vols[v].key.clone().ok_or_else(|| bad("encrypted volume is locked"))?;
+            key.encrypt(&mut block, node.addr * self.c.block_size / 512);
+        }
+        self.c.put_block(node.addr, block);
         Ok(node.oid)
     }
 

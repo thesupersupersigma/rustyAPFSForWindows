@@ -52,10 +52,17 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
         let mountpoint = rest.first().ok_or_else(usage)?;
         match rusty_apfs::write::Writer::open(image, partition) {
             Ok(w) if vol_idx >= w.volume_count() => return Err(io::Error::other(format!("no volume {vol_idx}"))),
-            Ok(w) => match w.read_only_reason(vol_idx) {
-                None => return rusty_apfs::mount::mount_rw(w, vol_idx, mountpoint),
-                Some(why) => eprintln!("mounting read-only: {why}"),
-            },
+            Ok(mut w) => {
+                if let Some(pw) = &password
+                    && w.is_locked(vol_idx)
+                {
+                    w.unlock(vol_idx, pw)?;
+                }
+                match w.read_only_reason(vol_idx) {
+                    None => return rusty_apfs::mount::mount_rw(w, vol_idx, mountpoint),
+                    Some(why) => eprintln!("mounting read-only: {why}"),
+                }
+            }
             Err(e) => eprintln!("mounting read-only: {e}"),
         }
     }
@@ -106,8 +113,16 @@ fn mount_all(containers: Vec<(String, Option<usize>)>, read_only: bool, password
     let mut mounts = vec![];
     for (path, partition) in containers {
         let writer = if read_only { None } else { rusty_apfs::write::Writer::open(&path, partition).ok() };
-        if let Some(w) = writer {
+        if let Some(mut w) = writer {
             let n = w.volume_count();
+            for v in 0..n {
+                if let Some(pw) = password
+                    && w.is_locked(v)
+                    && let Err(e) = w.unlock(v, pw)
+                {
+                    eprintln!("{path} volume {v}: {e}");
+                }
+            }
             let w = Arc::new(Mutex::new(w));
             for v in 0..n {
                 let Some(mp) = letters.next() else { break };

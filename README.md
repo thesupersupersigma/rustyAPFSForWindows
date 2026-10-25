@@ -17,7 +17,7 @@ and every write path is checked with an independent APFS checker (`apfsck`, see 
 | Compressed files (zlib, LZVN, LZFSE) | read; decompressed on first write |
 | Hard links, clones (copy-on-write), sparse files, symlinks | yes (symlinks show as Windows symlinks) |
 | Folder size tracking (directory statistics) | kept up to date |
-| Encrypted volumes (password / FileVault-style) | read with `--password` |
+| Encrypted volumes (password / FileVault-style) | read and write with `--password` (or the app's password box) |
 | Snapshots (Time Machine local snapshots) | read-only, can mount any snapshot |
 | Volumes with snapshots, sealed system volumes, Fusion drives | read-only (like Paragon's product) |
 | Hardware-encrypted (T2 / Apple silicon internal) disks | not readable from Windows |
