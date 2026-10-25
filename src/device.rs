@@ -29,7 +29,21 @@ impl Device {
     /// Opens an APFS container: a bare image/partition, or the `partition`-th APFS partition
     /// (default: the first) of a GPT disk.
     pub(crate) fn open(path: &Path, writable: bool, partition: Option<usize>) -> io::Result<Device> {
-        let file = fs::OpenOptions::new().read(true).write(writable).open(path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(writable);
+        // A writer shares only reading: a second writer (or another APFS driver) can't open the same
+        // device and corrupt it with interleaved commits.
+        #[cfg(windows)]
+        if writable {
+            std::os::windows::fs::OpenOptionsExt::share_mode(&mut opts, 1); // FILE_SHARE_READ
+        }
+        let file = opts.open(path).map_err(|e| {
+            if writable && e.raw_os_error() == Some(32) {
+                io::Error::new(io::ErrorKind::ResourceBusy, "the disk is already open for writing by another program")
+            } else {
+                e
+            }
+        })?;
         let mut dev = Device { file, base: 0 };
         let mut head = vec![0; 2 * ALIGN as usize];
         let n = dev.read_some(0, &mut head)?;

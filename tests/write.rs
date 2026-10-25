@@ -408,3 +408,15 @@ fn full_disk_fails_cleanly_and_recovers() {
     fsck(&p);
     assert_eq!(read(&p, "again.bin"), chunk);
 }
+
+#[test]
+fn second_writer_is_refused() {
+    let p = fresh("exclusive", 24, &["-L", "Excl"]);
+    let w = Writer::open(&p, None).unwrap();
+    let err = Writer::open(&p, None).err().expect("second writer opened");
+    assert_eq!(err.kind(), std::io::ErrorKind::ResourceBusy, "{err}");
+    // Readers are still welcome.
+    assert!(Container::open(&p).is_ok());
+    drop(w);
+    assert!(Writer::open(&p, None).is_ok());
+}

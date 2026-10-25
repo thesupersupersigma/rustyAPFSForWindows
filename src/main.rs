@@ -7,7 +7,9 @@ const USAGE: &str = "usage: apfs list                      (APFS partitions on p
        apfs <image|disk> ls  [path] [--volume N] [--snapshot NAME] [--password PW]
        apfs <image|disk> cat <path> [--volume N] [--snapshot NAME] [--password PW]
        apfs <image|disk> mount <X: | new-folder> [--volume N] [--snapshot NAME] [--password PW] [--read-only]
-                      (read-write unless --read-only, a snapshot, or a volume we can't write)";
+                      (read-write unless --read-only, a snapshot, or a volume we can't write)
+       apfs [image|disk] mount-all [--read-only] [--password PW]
+                      (every volume on free drive letters; without a path, every APFS disk; needs admin)";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -31,10 +33,20 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
     if args.first().map(String::as_str) == Some("list") {
         return list();
     }
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("mount-all") {
+        let read_only = args.iter().position(|a| a == "--read-only").map(|i| args.remove(i)).is_some();
+        let password = opt(&mut args, "--password");
+        return mount_all(physical_containers(), read_only, password.as_deref());
+    }
     let password = opt(&mut args, "--password");
     let read_only = args.iter().position(|a| a == "--read-only").map(|i| args.remove(i)).is_some();
     let [image, cmd, rest @ ..] = args.as_slice() else { return Err(usage()) };
 
+    #[cfg(windows)]
+    if cmd == "mount-all" {
+        return mount_all(vec![(image.clone(), partition)], read_only, password.as_deref());
+    }
     #[cfg(windows)]
     if cmd == "mount" && !read_only && snap.is_none() {
         let mountpoint = rest.first().ok_or_else(usage)?;
@@ -83,6 +95,73 @@ fn run(mut args: Vec<String>) -> io::Result<()> {
         "mount" => rusty_apfs::mount::mount(c, vol, rest.first().ok_or_else(usage)?),
         _ => Err(usage()),
     }
+}
+
+/// Mounts every readable volume of each container on free drive letters, writable where possible.
+#[cfg(windows)]
+fn mount_all(containers: Vec<(String, Option<usize>)>, read_only: bool, password: Option<&str>) -> io::Result<()> {
+    use rusty_apfs::mount;
+    use std::sync::{Arc, Mutex};
+    let mut letters = mount::free_drive_letters().into_iter();
+    let mut mounts = vec![];
+    for (path, partition) in containers {
+        let writer = if read_only { None } else { rusty_apfs::write::Writer::open(&path, partition).ok() };
+        if let Some(w) = writer {
+            let n = w.volume_count();
+            let w = Arc::new(Mutex::new(w));
+            for v in 0..n {
+                let Some(mp) = letters.next() else { break };
+                match mount::through_writer(&w, v, &mp) {
+                    Ok(m) => mounts.push(m),
+                    Err(e) => eprintln!("{path} volume {v}: skipped ({e})"),
+                }
+            }
+            continue;
+        }
+        let c = match partition {
+            Some(n) => Container::open_partition(&path, n),
+            None => Container::open(&path),
+        };
+        let c: &'static Container = match c {
+            Ok(c) => Box::leak(Box::new(c)),
+            Err(e) => {
+                eprintln!("{path}: {e}");
+                continue;
+            }
+        };
+        for (v, mut vol) in c.volumes()?.into_iter().enumerate() {
+            if vol.is_locked() {
+                match password {
+                    Some(pw) if vol.unlock(pw).is_ok() => {}
+                    _ => {
+                        eprintln!("{path} volume {v} ({:?}): encrypted, skipped (pass --password)", vol.name);
+                        continue;
+                    }
+                }
+            }
+            let Some(mp) = letters.next() else { break };
+            match mount::read_only(c, vol, &mp) {
+                Ok(m) => mounts.push(m),
+                Err(e) => eprintln!("{path} volume {v}: skipped ({e})"),
+            }
+        }
+    }
+    mount::serve(mounts)
+}
+
+/// Every APFS container on the physical disks.
+#[cfg(windows)]
+fn physical_containers() -> Vec<(String, Option<usize>)> {
+    let mut out = vec![];
+    for n in 0..32 {
+        let disk = format!(r"\\.\PhysicalDrive{n}");
+        match rusty_apfs::apfs_partitions(&disk) {
+            Ok(parts) => out.extend((0..parts.len()).map(|i| (disk.clone(), Some(i)))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("{disk}: {e}"),
+        }
+    }
+    out
 }
 
 fn info(c: &Container, password: Option<&str>) -> io::Result<()> {

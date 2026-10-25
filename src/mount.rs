@@ -114,6 +114,8 @@ enum Backend {
 
 pub struct ApfsFs {
     backend: Backend,
+    /// False for volumes the writer refuses (snapshots, sealed, ...): served read-only from its view.
+    writable: bool,
     block_size: u64,
     /// Container size, for read-only mounts (read-write ones ask the writer).
     total_size: u64,
@@ -128,7 +130,7 @@ fn lock(w: &Mutex<Writer>) -> io::Result<MutexGuard<'_, Writer>> {
 
 impl ApfsFs {
     fn rw(&self) -> bool {
-        matches!(self.backend, Backend::Rw { .. })
+        self.writable
     }
 
     /// Runs `f` on a view of the volume that includes uncommitted changes.
@@ -850,18 +852,24 @@ fn preload_winfsp() {
     }
 }
 
-fn run(fs: ApfsFs, serial: u32, case_insensitive: bool, mountpoint: &str) -> io::Result<()> {
-    preload_winfsp();
-    winfsp::winfsp_init().map_err(|e| io::Error::other(format!("WinFsp is not installed or failed to load: {e:?}")))?;
-    let rw = fs.rw();
+/// A volume ready to mount: the file system plus what WinFsp needs to know about it.
+pub struct Mount {
+    fs: ApfsFs,
+    serial: u32,
+    case_insensitive: bool,
+    pub mountpoint: String,
+}
+
+fn start(m: Mount) -> io::Result<FileSystemHost<ApfsFs>> {
+    let rw = m.fs.rw();
     let mut params = VolumeParams::new();
     params
         .filesystem_name("APFS")
         .sector_size(512)
-        .sectors_per_allocation_unit((fs.block_size / 512) as u16)
+        .sectors_per_allocation_unit((m.fs.block_size / 512) as u16)
         .max_component_length(255)
-        .volume_serial_number(serial)
-        .case_sensitive_search(!case_insensitive)
+        .volume_serial_number(m.serial)
+        .case_sensitive_search(!m.case_insensitive)
         .case_preserved_names(true)
         .unicode_on_disk(true)
         .persistent_acls(true)
@@ -870,69 +878,125 @@ fn run(fs: ApfsFs, serial: u32, case_insensitive: bool, mountpoint: &str) -> io:
         .post_cleanup_when_modified_only(true)
         // Read-only data never changes under us, so let Windows cache it; read-write must stay fresh.
         .file_info_timeout(if rw { 0 } else { u32::MAX });
-    let writer = match &fs.backend {
-        Backend::Rw { w, .. } => Some(w.clone()),
-        Backend::Ro(_) => None,
-    };
     let mut host: FileSystemHost<ApfsFs> =
-        FileSystemHost::new(params, fs).map_err(failed("creating the file system"))?;
-    host.mount(mountpoint).map_err(failed("mounting"))?;
+        FileSystemHost::new(params, m.fs).map_err(failed("creating the file system"))?;
+    host.mount(&m.mountpoint).map_err(failed("mounting"))?;
     host.start().map_err(failed("starting the dispatcher"))?;
+    println!("mounted at {} ({})", m.mountpoint, if rw { "read-write" } else { "read-only" });
+    Ok(host)
+}
+
+/// Mounts every volume in `mounts` and serves them until Ctrl+C, committing each writer about once a
+/// second while it has changes and once more on the way out.
+pub fn serve(mounts: Vec<Mount>) -> io::Result<()> {
+    preload_winfsp();
+    winfsp::winfsp_init().map_err(|e| io::Error::other(format!("WinFsp is not installed or failed to load: {e:?}")))?;
+    let mut writers: Vec<Arc<Mutex<Writer>>> = vec![];
+    for m in &mounts {
+        if let Backend::Rw { w, .. } = &m.fs.backend
+            && !writers.iter().any(|x| Arc::ptr_eq(x, w))
+        {
+            writers.push(w.clone());
+        }
+    }
+    let mut hosts = vec![];
+    for m in mounts {
+        let mp = m.mountpoint.clone();
+        match start(m) {
+            Ok(h) => hosts.push(h),
+            Err(e) => eprintln!("{mp}: {e}"),
+        }
+    }
+    if hosts.is_empty() {
+        return Err(io::Error::other("nothing could be mounted"));
+    }
     // SAFETY: registers a plain function; it only touches an atomic.
     unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
-    println!("mounted at {mountpoint} ({}); press Ctrl+C to unmount", if rw { "read-write" } else { "read-only" });
+    println!("press Ctrl+C to unmount");
     let mut ticks = 0;
     while !STOP.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(200));
         ticks += 1;
-        if let Some(w) = &writer
-            && ticks % 5 == 0
-            && let Ok(mut w) = lock(w)
-            && w.has_changes()
-            && let Err(e) = w.commit()
-        {
-            eprintln!("commit failed: {e}");
+        if ticks % 5 == 0 {
+            for w in &writers {
+                if let Ok(mut w) = lock(w)
+                    && w.has_changes()
+                    && let Err(e) = w.commit()
+                {
+                    eprintln!("commit failed: {e}");
+                }
+            }
         }
     }
-    host.stop();
-    host.unmount();
-    if let Some(w) = &writer {
-        lock(w).and_then(|mut w| w.commit())?;
+    for mut h in hosts {
+        h.stop();
+        h.unmount();
+    }
+    let mut result = Ok(());
+    for w in &writers {
+        if let Err(e) = lock(w).and_then(|mut w| w.commit()) {
+            result = Err(e);
+        }
     }
     println!("unmounted");
-    Ok(())
+    result
 }
 
-/// Mounts `vol` read-only at `mountpoint` (a drive like `X:` or a folder path that doesn't exist yet) until Ctrl+C.
-pub fn mount(c: &'static Container, vol: Volume<'static>, mountpoint: &str) -> io::Result<()> {
+/// Prepares `vol` for a read-only mount at `mountpoint` (a drive like `X:` or a new folder path).
+pub fn read_only(c: &'static Container, vol: Volume<'static>, mountpoint: &str) -> io::Result<Mount> {
     vol.root()?; // fail early on volumes we can't read (e.g. encrypted)
     let serial = u32::from_le_bytes(vol.superblock[240..244].try_into().unwrap());
-    let ci = vol.case_insensitive();
+    let case_insensitive = vol.case_insensitive();
     let total_size = u64::from_le_bytes(c.superblock[40..48].try_into().unwrap()) * c.block_size; // nx_block_count
     let fs = ApfsFs {
+        writable: false,
         block_size: c.block_size,
         total_size,
         label: vol.name.clone(),
         backend: Backend::Ro(vol),
         sd: security_descriptor()?,
     };
-    run(fs, serial, ci, mountpoint)
+    Ok(Mount { fs, serial, case_insensitive, mountpoint: mountpoint.to_string() })
+}
+
+/// Prepares volume `v` of a shared writer; it is writable unless the writer refuses that volume.
+pub fn through_writer(w: &Arc<Mutex<Writer>>, v: usize, mountpoint: &str) -> io::Result<Mount> {
+    let guard = lock(w)?;
+    let (serial, case_insensitive, label) = {
+        let vol = guard.view(v)?;
+        vol.root()?;
+        (u32::from_le_bytes(vol.superblock[240..244].try_into().unwrap()), vol.case_insensitive(), vol.name.clone())
+    };
+    let fs = ApfsFs {
+        writable: guard.read_only_reason(v).is_none(),
+        block_size: guard.block_size(),
+        total_size: 0,
+        label,
+        backend: Backend::Rw { w: w.clone(), v },
+        sd: security_descriptor()?,
+    };
+    Ok(Mount { fs, serial, case_insensitive, mountpoint: mountpoint.to_string() })
+}
+
+/// Mounts `vol` read-only at `mountpoint` until Ctrl+C.
+pub fn mount(c: &'static Container, vol: Volume<'static>, mountpoint: &str) -> io::Result<()> {
+    serve(vec![read_only(c, vol, mountpoint)?])
 }
 
 /// Mounts volume `v` of `w` read-write at `mountpoint` until Ctrl+C, committing changes as it goes.
 pub fn mount_rw(w: Writer, v: usize, mountpoint: &str) -> io::Result<()> {
-    let (serial, ci, label) = {
-        let vol = w.view(v)?;
-        (u32::from_le_bytes(vol.superblock[240..244].try_into().unwrap()), vol.case_insensitive(), vol.name.clone())
-    };
-    let fs = ApfsFs {
-        block_size: w.block_size(),
-        total_size: 0,
-        label,
-        backend: Backend::Rw { w: Arc::new(Mutex::new(w)), v },
-        sd: security_descriptor()?,
-    };
-    run(fs, serial, ci, mountpoint)
+    serve(vec![through_writer(&Arc::new(Mutex::new(w)), v, mountpoint)?])
+}
+
+/// Drive letters not in use, from Z: down (so they don't collide with removable drives Windows adds).
+pub fn free_drive_letters() -> Vec<String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    // SAFETY: no arguments; returns a bitmask of drive letters in use.
+    let used = unsafe { GetLogicalDrives() };
+    (b'D'..=b'Z').rev().filter(|&c| used & (1 << (c - b'A')) == 0).map(|c| format!("{}:", c as char)).collect()
 }
 
 #[cfg(test)]
