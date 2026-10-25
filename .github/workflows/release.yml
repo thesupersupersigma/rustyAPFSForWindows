@@ -1,0 +1,58 @@
+# Builds apfs.exe and apfs-gui.exe and publishes them as a GitHub release whenever a version tag
+# (v1.0.0, v1.2.3, ...) is pushed: git tag v1.0.0 && git push origin v1.0.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build a release for, e.g. v1.0.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      # The WinFsp bindings are generated with bindgen, which needs libclang (LLVM is preinstalled).
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked --features gui
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "rustyAPFS-$env:TAG-windows-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/apfs.exe, target/release/apfs-gui.exe, README.md, LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower() + "  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: rustyAPFS ${{ env.TAG }}
+          files: |
+            rustyAPFS-${{ env.TAG }}-windows-x64.zip
+            rustyAPFS-${{ env.TAG }}-windows-x64.zip.sha256
+          body: |
+            Read and write Mac (APFS) drives on Windows.
+
+            **Install:** install [WinFsp](https://github.com/winfsp/winfsp/releases) first, then unzip and run
+            `apfs-gui.exe` (as administrator for physical disks), or use `apfs.exe` from a terminal.
+
+            **Try it on a spare drive or a disk image first**, and keep backups of anything important.
+            See the README for usage and limitations.

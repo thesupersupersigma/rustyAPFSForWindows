@@ -19,13 +19,15 @@ and every write path is checked with an independent APFS checker (`apfsck`, see 
 | Folder size tracking (directory statistics) | kept up to date |
 | Encrypted volumes (password / FileVault-style) | read and write with `--password` (or the app's password box) |
 | Snapshots (Time Machine local snapshots) | read-only, can mount any snapshot |
-| Volumes with snapshots, sealed system volumes, Fusion drives | read-only (like Paragon's product) |
+| Volumes with snapshots, sealed system volumes, Fusion drives | read-only |
 | Hardware-encrypted (T2 / Apple silicon internal) disks | not readable from Windows |
 
 ## Install
 
-1. Install [WinFsp](https://github.com/winfsp/winfsp/releases) (the `.msi`).
-2. Get `apfs.exe` and `apfs-gui.exe` (build them, see below).
+1. Install [WinFsp](https://github.com/winfsp/winfsp/releases) (the `.msi`). It's what lets a program show up
+   as a drive letter.
+2. Download the latest `rustyAPFS-*-windows-x64.zip` from [Releases](../../releases) and unzip it anywhere.
+   (Or build it yourself, see [Build](#build).)
 
 ## Use it
 
@@ -55,8 +57,8 @@ Options: `--volume N` (default 0), `--partition N` (which APFS partition of a di
   pulled or Windows crashes, you lose at most the last second of changes and the volume stays consistent
   (APFS writes metadata copy-on-write). Like most file systems, data overwritten in place during that last
   second may be partly new.
-- Only one program can write to a disk at a time; a second writer (including another APFS driver, such as
-  Paragon's) is refused while a volume is mounted read-write.
+- Only one program can write to a disk at a time; a second writer (including another APFS driver) is
+  refused while a volume is mounted read-write.
 - File names are limited to 255 bytes of UTF-8 (macOS's limit), so very long non-Latin names are refused.
 - Files copied from Windows get owner "unknown" (uid/gid 99), like files on any external Mac drive.
 
@@ -113,6 +115,21 @@ shorter than their container. apfsck can't check software-encrypted volumes.
 | `src/write/` | the writer: copy-on-write B-trees, space manager, checkpoints, file operations |
 | `src/mount.rs` | WinFsp file system (read-only and read-write) |
 | `src/main.rs`, `src/bin/apfs-gui.rs` | command line and desktop app |
+
+## Disclaimer
+
+This is an independent project, not affiliated with or endorsed by Apple. Apple, Mac, macOS and APFS are
+trademarks of Apple Inc.
+
+Writing to a file system is risky. Everything here is tested against Apple-made images and an independent
+checker, but it hasn't been verified by macOS on every kind of drive. **Try it on a spare drive or a disk
+image first and keep backups** of anything you care about. It comes with no warranty (see the license).
+
+## Contributing
+
+Bug reports are very welcome, especially from real Mac drives: say which macOS formatted the drive, what you
+did, and the output of `apfs <disk> info`. If a volume ends up damaged, running First Aid in macOS Disk
+Utility and including what it says helps a lot.
 
 ## License
 
